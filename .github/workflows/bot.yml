@@ -22,9 +22,9 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run multiple bots
+      - name: Run bots safely
         run: |
+          python app.py &
           python app2.py &
-
-          
+          sleep 240
           
