@@ -1,3255 +1,598 @@
 import asyncio
-import time
-import sqlite3
-import os
+import random
 import json
-import re
-import aiohttp
-import requests
-import aiosqlite
+import os
+import logging
+from telegram import Update, Bot, ChatPermissions
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    ChatMemberHandler,
+    filters
+)
 
-from telethon import TelegramClient, events, Button
-from telethon.tl.types import ChannelParticipantsAdmins
-from telethon.errors import FloodWaitError
-from telethon.utils import get_display_name
-from datetime import datetime
-from telethon.tl.types import UpdateChatParticipantAdd
-from telethon.errors import FloodWaitError, RPCError
-from telethon.tl.custom.message import Message
-from telethon.tl.functions.channels import EditBannedRequest
-from telethon.tl.functions.channels import InviteToChannelRequest
-from telethon.utils import get_display_name
-from telethon.tl.types import ChannelParticipantsSearch
-from datetime import date
-from telethon.tl.types import ChannelParticipant, User, Chat
-from telethon.tl.types import ChatBannedRights
-from telethon.tl.functions.channels import GetFullChannelRequest
-from telethon import events, Button
-from telethon.errors.rpcerrorlist import ChatAdminRequiredError
-from deep_translator import GoogleTranslator
-from telethon.tl.types import InputMessagesFilterVideo
-from telethon.tl.types import PeerUser
-from datetime import timedelta
-from collections import defaultdict
-from telethon.tl.types import ChatAdminRights
-from telethon.tl.functions.channels import EditAdminRequest
+# Logging Setup
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ==========================
-# TRACE_API URL သတ်မှတ်
-# ==========================
-TRACE_API = "https://api.trace.moe/search"
-
-# ==========================
-# Config
-# ==========================
-API_ID = 32152246
-API_HASH = "86efb74e76787ba8b9d99f852b6c9b30"
-BOT_TOKEN = "8870636741:AAE23LSAL_Ea1xWAgBdj4xVsyFNh684SuGg"
-
+# --- CONFIGURATION & STORAGE ---
+TOKEN = "9116044625:AAG5jTvKuPEFVmBJUHfYEQp9PEUEYNA7hco"
 OWNER_ID = 8912043173
-BOT_OWNER_ID = 8912043173
-DB_FILE = "bot_data.db"
 
-# ==========================
-# MAIN BOT DATABASE
-# ==========================
-
-conn = sqlite3.connect("bot_data.db", check_same_thread=False)
-cursor = conn.cursor()
-
-# ==========================
-# ATTACK SAVE TABLE
-# ==========================
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS asave (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER,
-    text TEXT
-)
-""")
-
-# ==========================
-# REPLY SAVE TABLE
-# ==========================
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS rsave (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER,
-    text TEXT
-)
-""")
-
-# ==========================
-# TROLL SAVE TABLE
-# ==========================
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS tsave (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER,
-    text TEXT
-)
-""")
-
-# ==========================
-# BOT ADMINS TABLE
-# ==========================
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS bot_admins (
-    user_id INTEGER PRIMARY KEY
-)
-""")
-
-# ==========================
-# ACTIVE GROUPS TABLE
-# ==========================
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS active_groups (
-    chat_id INTEGER PRIMARY KEY
-)
-""")
-
-# ==========================
-# FILTER TABLE
-# ==========================
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS filters (
-    chat_id INTEGER,
-    trigger TEXT,
-    reply TEXT
-)
-""")
-
-conn.commit()
-
-# ==========================
-# PROTECTED USERS
-# ==========================
-protected_conn = sqlite3.connect("protected.db", check_same_thread=False)
-protected_cursor = protected_conn.cursor()
-
-protected_cursor.execute("""
-CREATE TABLE IF NOT EXISTS protected_users (
-    user_id INTEGER PRIMARY KEY
-)
-""")
-protected_conn.commit()
-
-protected_cursor.execute("SELECT user_id FROM protected_users")
-protected_users = set(row[0] for row in protected_cursor.fetchall())
-
-# ==========================
-# TELETHON CLIENT
-# ==========================
-bot = TelegramClient("Bot18", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
-
-print("✅ Bot Started Successfully!")
-
-# ==========================
-# TYPING WRAPPER ONLY
-# ==========================
-
-# Save original functions
-original_send_message = bot.send_message
-original_send_file = bot.send_file
-
-# --------------------------
-# Send message with typing
-# --------------------------
-async def send_message_with_typing(chat_id, *args, **kwargs):
-    try:
-        async with bot.action(chat_id, 'typing'):
-            await asyncio.sleep(0.5)  # typing duration
-    except:
-        pass
-    return await original_send_message(chat_id, *args, **kwargs)
-
-# --------------------------
-# Send file with typing
-# --------------------------
-async def send_file_with_typing(chat_id, *args, **kwargs):
-    try:
-        async with bot.action(chat_id, 'typing'):
-            await asyncio.sleep(0.5)  # typing duration
-    except:
-        pass
-    return await original_send_file(chat_id, *args, **kwargs)
-
-# --------------------------
-# Override bot functions
-# --------------------------
-bot.send_message = send_message_with_typing
-bot.send_file = send_file_with_typing
-
-# ==========================
-# Permission Check
-# ==========================
-
-def is_owner(user_id):
-    return user_id == OWNER_ID
-
-
-def is_admin(user_id):
-    cursor.execute("SELECT 1 FROM bot_admins WHERE user_id=?", (user_id,))
-    return cursor.fetchone() is not None
-
-
-def is_member(user_id):
-    return not (is_owner(user_id) or is_admin(user_id))
-
-
-def is_bot_admin(user_id):
-    return is_admin(user_id)
-
-
-# ==========================
-# GROUP CACHE
-# ==========================
-
-GROUPS = set()
-
-
-@bot.on(events.ChatAction)
-async def save_group(event):
-    if event.is_group:
-        GROUPS.add(event.chat_id)
-
-
-# ==========================
-# RAW EVENT HANDLER
-# ==========================
-
-@bot.on(events.Raw)
-async def raw_handler(event):
-    if isinstance(event, UpdateChatParticipantAdd):
-        print("User joined")
-
-
-# ==========================
-# CHECK PERMISSIONS
-# ==========================
-
-def has_permission(user_id):
-    return is_owner(user_id) or is_admin(user_id)
-
-# ==========================
-# RSAVE FILE SYSTEM
-# ==========================
-
-RSAVE_FILE = "rsave_data.json"
-rsave_list = []
-
-def save_rsave():
-    with open(RSAVE_FILE, "w") as f:
-        json.dump(rsave_list, f)
-
-def load_rsave():
-    global rsave_list
-    if os.path.exists(RSAVE_FILE):
-        with open(RSAVE_FILE, "r") as f:
-            rsave_list = json.load(f)
-    else:
-        rsave_list = []
-
-# ==========================
-# Global States
-# ==========================
-troll_targets = {}
-delete_targets = {}
-att_targets = {}
-attack_speed = 1
-GROUPS = set()
-
-
-try:    
-     result = GoogleTranslator(source="en", target="my").translate("hello")
-except Exception as e:            print(f"Translation test skipped: {e}")
-print("မင်္ဂလာပါဖေလိုးမ")
-
-TRUSTED_BOTS = [8912043173]  # Owner ID ထည့်ပါ
-TRUSTED_BOTS += [8912043173]  # နောက်ထပ် trusted user IDs ထည့်နိုင်
-
-calling_task = None
-stop_calling = False
-
-reply_task_started = False
-
-REPLY_DURATION = 86400  # 24 hours
-REPLY_INTERVAL = 1
-
-reply_targets = {}
-bot_id = None
-
-current_index = 0
-
-LINK_WORDS = ["@", "bio", "ဘိုင်O", "ဘိုင်အို", "http://", "https://", "t.me/", "telegram.me"]
-
-# ==========================
-# GROUP SPEED STORAGE
-# ==========================
-group_speeds = {}   # {chat_id: speed}
-
-# ==========================
-# SPEED CONTROL (PER GROUP)
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^အရှိန် (.+)"))
-async def set_speed(event):
-
-    if not (is_owner(event.sender_id) or is_admin(event.sender_id)):
-        return await event.reply("မင်းမာ Permission မရှိတဲ့အတွက်သုံးလို့မရဘူး ❌")
-
-    chat_id = event.chat_id
-
-    try:
-        speed = float(event.pattern_match.group(1))
-
-        if speed < 0:
-            speed = 0
-
-        group_speeds[chat_id] = speed
-
-        await event.reply(f"အမြန်နှုန်းကို {speed} စက္ကန့်သို့ချိန်ညှိလိုက်ပါပီ")
-
-    except:
-        await event.reply("Invalid number.")
-
-
-# ==========================
-# ATTACK TASK STORAGE
-# ==========================
-attack_tasks = {}  # {chat_id: {target_id: task}}
-
-
-# ==========================
-# ATTACK COMMAND
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^သတ်ပလိုက်(?:\s|$)"))
-async def attack_user(event):
-
-    if not (is_owner(event.sender_id) or is_admin(event.sender_id)):
-        return await event.reply("မင်းမာ Permission မရှိတဲ့အတွက်သုံးလို့မရဘူး ❌")
-
-    chat_id = event.chat_id
-
-    # -------- TARGET DETECT --------
-
-    if event.is_reply:
-        reply_msg = await event.get_reply_message()
-        target_id = reply_msg.sender_id
-    else:
-        args = event.message.text.split()
-
-        if len(args) < 2:
-            return await event.reply(
-                "မျိုးမစစ်တွေကိုနှိမ်နှင်းစေချင်ရင်မိန့်ကိုမှန်ကန်စွာအသုံးပြုပါ (သတ်ပလိုက်) (Reply)"
-            )
-
-        try:
-            entity = await bot.get_entity(args[1])
-            target_id = entity.id
-        except:
-            return await event.reply("မင်းပြောတဲ့ခွေးမျိုးလေးကိုရှာမတွေ့သေးပါ Try.")
-
-    # -------- OWNER PROTECTION --------
-
-    if is_owner(target_id):
-        return await event.reply(
-            "Bot Owner အပေါ်ကိုသက်ရောက်မှုမရှိတဲ့အတွက်သူံးလို့မရပါ❌"
-        )
-
-    # -------- GET ASAVE TEXTS --------
-
-    texts = cursor.execute(
-        "SELECT text FROM asave ORDER BY id ASC"
-    ).fetchall()
-
-    if not texts:
-        return await event.reply(
-            "နှိမ်နှင်းရမဲ့စာသားတွေကိုသိမ်းဆည်းထားချင်းမရှိသောကြေင့်ပြုလုပ်၍မရပါ"
-        )
-
-    # -------- INIT GROUP DICT --------
-
-    if chat_id not in attack_tasks:
-        attack_tasks[chat_id] = {}
-
-    # -------- CHECK ALREADY RUNNING --------
-
-    if target_id in attack_tasks[chat_id]:
-        return await event.reply("Already attacking this user.")
-
-    user = await bot.get_entity(target_id)
-
-    # -------- SPAM LOOP --------
-
-    async def spam():
-
-        index = 0
-        end_time = asyncio.get_event_loop().time() + (24 * 60 * 60)
-
-        try:
-            while asyncio.get_event_loop().time() < end_time:
-
-                if target_id not in attack_tasks.get(chat_id, {}):
-                    break
-
-                text = texts[index % len(texts)][0]
-
-                message = (
-                    f"<a href='tg://user?id={user.id}'>{user.first_name}</a> {text}"
-                )
-
-                try:
-                    await bot.send_message(
-                        chat_id,
-                        message,
-                        parse_mode="html"
-                    )
-
-                except FloodWaitError as e:
-                    await asyncio.sleep(e.seconds)
-                    continue
-
-                index += 1
-
-                # -------- GROUP SPEED --------
-                speed = group_speeds.get(chat_id, 1.0)
-
-                await asyncio.sleep(speed)
-
-        except asyncio.CancelledError:
-            pass
-
-    task = asyncio.create_task(spam())
-
-    attack_tasks[chat_id][target_id] = task
-
-    await event.reply(
-        "ထိုတောသားကိုဖင်စလိုးပါပီသခင်"
-    )
-
-
-# ==========================
-# STOP ONLY CURRENT GROUP
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^ရပ်တော့"))
-async def stop_attack(event):
-
-    if not (is_owner(event.sender_id) or is_admin(event.sender_id)):
-        return await event.reply("မင်းမာ Permission မရှိတဲ့အတွက်သုံးလို့မရဘူး ❌")
-
-    chat_id = event.chat_id
-
-    if chat_id in attack_tasks:
-
-        for task in attack_tasks[chat_id].values():
-            task.cancel()
-
-        attack_tasks[chat_id].clear()
-
-    await event.reply("ဖာသည်မသားအပေါင်း ငါလက်အောက်ကနေငြိမ်းချမ်းစေသား")
-
-PAGE_SIZE = 50  # စာ 50 ခုချင်းပြ
-
-# ==============================
-# RSAVE (OWNER ONLY)
-# ==============================
-@bot.on(events.NewMessage(pattern=r"(?i)^/rsave (.+)"))
-async def save_r(event):
-    if not is_owner(event.sender_id):
-        return
-
-    text = event.pattern_match.group(1)
-    rsave_list.append(text)
-    save_rsave()  # function to persist list
-
-    await event.reply(f"Saved ✅\nTotal Saved: {len(rsave_list)}")
-
-
-# ==============================
-# Generic Show Page Function for Rsave
-# ==============================
-async def show_rsave_page(event, page):
-    start = page * PAGE_SIZE
-    end = start + PAGE_SIZE
-    current_rows = rsave_list[start:end]
-
-    if not current_rows:
-        await event.answer("No more pages.", alert=True)
-        return
-
-    msg_lines = [f"{i+1+start}. {msg}" for i, msg in enumerate(current_rows)]
-    msg_text = "<blockquote>🔥 Rsave List 🔥\n\n" + "\n".join(msg_lines) + "</blockquote>"
-
-    buttons = []
-    if page > 0:
-        buttons.append(Button.inline("⬅ Previous", data=f"rsave_prev_{page-1}".encode()))
-    if end < len(rsave_list):
-        buttons.append(Button.inline("Next ➡", data=f"rsave_next_{page+1}".encode()))
-
-    await event.reply(msg_text, buttons=buttons, parse_mode="html")
-
-# =======================
-# MEMBERS BAN FOUNDATION
-# ========================
-
-ban_count = {}
-alert_tasks = {}
-
-@bot.on(events.ChatAction)
-async def auto_owner_alert(event):
-
-    try:
-        msg = event.action_message
-
-        # ❌ IMPORTANT: avoid None crash
-        if not msg:
-            return
-
-        action = str(msg.action)
-
-        # only detect user removal (ban/kick)
-        if "DeleteUser" not in action:
-            return
-
-        chat_id = event.chat_id
-
-        # count bans per group
-        ban_count[chat_id] = ban_count.get(chat_id, 0) + 1
-
-        # trigger after 2 bans
-        if ban_count[chat_id] < 2:
-            return
-
-        # avoid duplicate loops
-        if chat_id in alert_tasks:
-            return
-
-        # safe owner fetch (no admin API crash)
-        try:
-            admins = await bot.get_participants(chat_id, limit=10)
-            owner = admins[0]
-        except:
-            owner = None
-
-        async def reminder_loop():
-
-            for _ in range(3):
-
-                if owner:
-                    mention = f"[{owner.first_name}](tg://user?id={owner.id})"
-                else:
-                    mention = "Owner"
-
-                await bot.send_message(
-                    chat_id,
-                    f"⚠️ Anti-Ban Alert\n\n"
-                    f"{mention}\n"
-                    f"Multiple members were banned.\n"
-                    f"Reply with: isee",
-                    parse_mode="md"
-                )
-
-                await asyncio.sleep(30)
-
-            alert_tasks.pop(chat_id, None)
-
-        task = asyncio.create_task(reminder_loop())
-        alert_tasks[chat_id] = task
-
-        ban_count[chat_id] = 0
-
-    except Exception as e:
-        print(f"AntiBan Error: {e}")
-
-@bot.on(events.NewMessage(pattern=r"(?i)^isee$"))
-async def stop_alert(event):
-
-    chat_id = event.chat_id
-
-    task = alert_tasks.get(chat_id)
-
-    if task:
-        task.cancel()
-        alert_tasks.pop(chat_id, None)
-
-        await event.reply("✅ Alert stopped.")
-
-# ==============================
-# List Rsave (/rlist)
-# ==============================
-@bot.on(events.NewMessage(pattern=r"(?i)^/rlist$"))
-async def list_r(event):
-    if not is_owner(event.sender_id):
-        return
-
-    if not rsave_list:
-        await event.reply("<blockquote>⚠️ Rsave list is empty.</blockquote>", parse_mode="html", reply_to=event.message.id)
-        return
-
-    await show_rsave_page(event, 0)
-
-
-# ==============================
-# Pagination Button Handler
-# ==============================
-@bot.on(events.CallbackQuery(pattern=b"rsave_(prev|next)_(\\d+)"))
-async def paginate_rsave(event):
-    action, page = [x.decode() if isinstance(x, bytes) else x for x in event.pattern_match.groups()]
-    page = int(page)
-
-    start = page * PAGE_SIZE
-    end = start + PAGE_SIZE
-    current_rows = rsave_list[start:end]
-
-    if not current_rows:
-        await event.answer("No more pages.", alert=True)
-        return
-
-    msg_lines = [f"{i+1+start}. {msg}" for i, msg in enumerate(current_rows)]
-    msg_text = "<blockquote>🔥 Rsave List 🔥\n\n" + "\n".join(msg_lines) + "</blockquote>"
-
-    buttons = []
-    if page > 0:
-        buttons.append(Button.inline("⬅ Previous", data=f"rsave_prev_{page-1}".encode()))
-    if end < len(rsave_list):
-        buttons.append(Button.inline("Next ➡", data=f"rsave_next_{page+1}".encode()))
-
-    await event.edit(msg_text, buttons=buttons, parse_mode="html")
-    await event.answer()
-
-# ================= REPLY ACTIVATE =================
-
-@bot.on(events.NewMessage(pattern=r"(?i)^လွတ်အောင်ပြေး$"))
-async def set_reply(event):
-    global bot_id
-
-    if not (is_owner(event.sender_id) or is_admin(event.sender_id)):
-        return
-
-    if not event.is_reply:
-        return await event.reply("Reply to target user.")
-
-    reply_msg = await event.get_reply_message()
-
-    if bot_id is None:
-        bot_id = (await bot.get_me()).id
-
-    if reply_msg.sender_id == bot_id:
-        return
-
-    if is_owner(reply_msg.sender_id):
-        return
-
-    target_id = reply_msg.sender_id
-    target_entity = await bot.get_entity(target_id)
-
-    if target_id not in reply_targets:
-        reply_targets[target_id] = {
-            "expire": time.time() + REPLY_DURATION,
-            "base_msg_id": reply_msg.id,
-            "chat_id": event.chat_id,
-            "last_bot_msg": None,
-            "mode": "reply",
-            "username": target_entity.username,
-            "index": 0
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE = os.path.join(BASE_DIR, "bot_database_v24.json")
+
+class BotDatabase:
+    def __init__(self):
+        self.normal_replies = []
+        self.active_attacks = {} 
+        self.known_chats = set()
+        self.authorized_users = {OWNER_ID}
+        
+        self.custom_welcomes = {}
+        self.custom_goodbyes = {}
+        
+        self.load()
+
+    def save(self):
+        data = {
+            "normal_replies": self.normal_replies,
+            "known_chats": list(self.known_chats),
+            "authorized_users": list(self.authorized_users),
+            "custom_welcomes": self.custom_welcomes,
+            "custom_goodbyes": self.custom_goodbyes
         }
-
-    asyncio.create_task(reply_loop(target_id))
-
-    await event.reply("မင်းနှင်းခိုင်းလိုက်တဲ့ဖာသယ်မသား ဒီကမ္ဘာငြိမ်းချမ်းမှုဆိုတာသူ့အတွက်မရှိစေရဘူး")
-
-# ================= UNREPLY (OWNER + ADMIN) =================
-
-@bot.on(events.NewMessage(pattern=r"(?i)^ပေးနားလိုက်"))
-async def unset_reply(event):
-
-    if not (is_owner(event.sender_id) or is_admin(event.sender_id)):
-        return
-
-    chat_id = event.chat_id  # ဒီ group id ကို key အနေနဲ့သုံးမယ်
-
-    # Reply မပြန်ဘဲ ရိုက်လိုက်ရင် → ဒီ Group ထဲကပဲ clear
-    if not event.is_reply:
-        found = False
-        for uid in list(reply_targets.keys()):
-            # uid က dict key, chat_id နဲ့ filter
-            if reply_targets[uid]["chat_id"] == chat_id:
-                del reply_targets[uid]
-                found = True
-
-        if not found:
-            return await event.reply("ဘယ်လိုခွေးမျိုး အမျိုးစားများကိုမှနှိမ်နှင်းထားချင်းမရှိသေးပါ")
-
-        return await event.reply("မျိုးမစစ်ပေါင်းသောင်းနဲ့ချီ ငါ့လက်ကလွတ်ငြိမ်းချမ်းသာစေသား")
-
-    # Reply ပြန်ပြီး ရိုက်ရင် → ဒီ Group ထဲက user တစ်ယောက်ပဲ ရပ်
-    reply_msg = await event.get_reply_message()
-    target_id = reply_msg.sender_id
-
-    if target_id in reply_targets and reply_targets[target_id]["chat_id"] == chat_id:
-        del reply_targets[target_id]
-        return await event.reply("မျိုးမစစ်ပေါင်းသောင်းနဲ့ချီ လွတ်ငြိမ်းချမ်းသာစေသား")
-
-    await event.reply("This user not active.")
-
-# ================= TRACK USER NEW MESSAGE =================
-
-@bot.on(events.NewMessage)
-async def track_user(event):
-    global bot_id
-
-    if bot_id is None:
-        bot_id = (await bot.get_me()).id
-
-    if event.sender_id == bot_id:
-        return
-
-@bot.on(events.NewMessage)
-async def track_user(event):
-    global bot_id
-
-    if bot_id is None:
-        bot_id = (await bot.get_me()).id
-
-    if event.sender_id == bot_id:
-        return
-
-    if event.sender_id in reply_targets:
-        data = reply_targets[event.sender_id]
-        data["base_msg_id"] = event.id
-        data["mode"] = "reply"
-
-# ================= DELETE DETECT =================
-
-@bot.on(events.MessageDeleted)
-async def detect_delete(event):
-    for target_id, data in reply_targets.items():
-        if data["last_bot_msg"] in event.deleted_ids:
-            data["mode"] = "mention"
-
-
-async def reply_loop(target_id):
-    global current_index
-
-    while target_id in reply_targets:
-
-        data = reply_targets.get(target_id)
-        if not data:
-            break
-
-        if not rsave_list:
-            await asyncio.sleep(2)
-            continue
-
         try:
-            text = rsave_list[current_index]
+            with open(DATA_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            logger.error(f"Save error: {e}")
 
-            msg = await bot.send_message(
-                data["chat_id"],
-                text,
-                reply_to=data["base_msg_id"]
-            )
-
-            data["last_bot_msg"] = msg.id
-
-            current_index += 1
-
-            if current_index >= len(rsave_list):
-                current_index = 0
-
-        except:
-            pass
-
-        await asyncio.sleep(REPLY_INTERVAL)
-
-
-# ==========================
-# TRACK DELETE
-# ==========================
-@bot.on(events.MessageDeleted)
-async def track_delete(event):
-
-    for uid, data in reply_targets.items():
-        if data["base_msg_id"] in event.deleted_ids:
-            data["base_msg_id"] = None
-            data["mode"] = "mention"
-
-# TRACK DELETE# ==========================
-# REPLY ENGINE (REPLY + MENTION)
-# ==========================
-async def reply_engine():
-
-    while True:
-        await asyncio.sleep(REPLY_INTERVAL)
-
-        if not rsave_list:
-            continue
-
-        for uid in list(reply_targets.keys()):
-
-            data = reply_targets.get(uid)
-            if not data:
-                continue
-
-            # ✅ EXPIRE CHECK (FIXED)
-            if time.time() > data["expire"]:
-                del reply_targets[uid]
-                continue
-
-            text = rsave_list[data["index"] % len(rsave_list)]
-            data["index"] += 1
-
+    def load(self):
+        if os.path.exists(DATA_FILE):
             try:
-
-                # delete previous bot message
-                if data["last_bot_msg"]:
-                    try:
-                        await bot.delete_messages(
-                            data["chat_id"],
-                            data["last_bot_msg"]
-                        )
-                    except:
-                        pass
-
-                # ==========================
-                # REPLY MODE
-                # ==========================
-                if data["mode"] == "reply" and data["base_msg_id"]:
-
-                    bot_msg = await bot.send_message(
-                        data["chat_id"],
-                        text,
-                        reply_to=data["base_msg_id"]
-                    )
-
-                # ==========================
-                # MENTION MODE
-                # ==========================
-                else:
-
-                    if data["username"]:
-                        mention_text = f"@{data['username']} {text}"
-                        bot_msg = await bot.send_message(
-                            data["chat_id"],
-                            mention_text
-                        )
-                    else:
-                        mention_text = f"<a href='tg://user?id={uid}'>User</a> {text}"
-                        bot_msg = await bot.send_message(
-                            data["chat_id"],
-                            mention_text,
-                            parse_mode="html"
-                        )
-
-                data["last_bot_msg"] = bot_msg.id
-
+                with open(DATA_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.normal_replies = data.get("normal_replies", self.normal_replies)
+                    self.known_chats = set(data.get("known_chats", []))
+                    saved_users = data.get("authorized_users", [OWNER_ID])
+                    self.authorized_users = set(saved_users)
+                    self.authorized_users.add(OWNER_ID)
+                    self.custom_welcomes = data.get("custom_welcomes", {})
+                    self.custom_goodbyes = data.get("custom_goodbyes", {})
             except Exception as e:
-                print("Reply Engine Error:", e)
+                logger.error(f"Load error: {e}")
 
-# ==========================
-# TROLL SYSTEM
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^ရိုက်သတ်"))
-async def set_troll(event):
-    if not (is_owner(event.sender_id) or is_admin(event.sender_id)):
-        return await event.reply("မင်းမှာ Permission မရှိတဲ့အတွက်သုံးလို့မရဘူးငါ့ညီ ❌")
+db = BotDatabase()
 
-    if not event.is_reply:
-        return await event.reply("❌အသုံးပြုပုံမှားယွင်းနေပါတယ် (ရိုက်သတ်) <reply_user> .....။")
-
-    reply_msg = await event.get_reply_message()
-    target_id = reply_msg.sender_id
-
-    # 🚫 OWNER PROTECTION
-    if is_owner(target_id):
-        return await event.reply("Bot Owner အပေါ်ကိုသက်ရောက်မှုမရှိတဲ့အတွက်သုံးလို့မရပါ❌")
-
-    troll_targets[target_id] = {
-        "index": 0
-    }
-
-    await event.reply("တိုက်ခိုက်မှုကိုစတင်လိုက်ပါပီ ရပ်တန့်လိုပါက (ခွင့်လွတ်လိုက်) <reply> ....။")
-
-
-@bot.on(events.NewMessage(pattern=r"(?i)^ခွင့်လွတ်လိုက်"))
-async def unset_troll(event):
-    if not (is_owner(event.sender_id) or is_admin(event.sender_id)):
-        return await event.reply("ဖာသည်မသားအပေါင်း ငါလက်အောက်ကနေငြိမ်းချမ်းစေသား")
-
-    troll_targets.clear()
-    await event.reply("ဖာသည်မသားအပေါင်း ငါလက်အောက်ကနေငြိမ်းချမ်းစေသား")
-
-
-# ==========================
-# AUTO MONITOR
-# ==========================
-@bot.on(events.NewMessage(incoming=True))
-async def monitor_messages(event):
-
-    if event.sender_id is None:
-        return
-
-    # 🚫 OWNER IMMUNITY
-    if is_owner(event.sender_id):
-        return
-
-    # ================= REPLY MODE =================
-    if event.sender_id in reply_targets:
-
-        texts = cursor.execute(
-            "SELECT text FROM rsave ORDER BY id ASC"
-        ).fetchall()
-
-        if texts:
-
-            data = reply_targets[event.sender_id]
-
-            # 24h expire check
-            if time.time() > data.get("expire", 0):
-                del reply_targets[event.sender_id]
-                return
-
-            text = texts[data["index"] % len(texts)][0]
-            data["index"] += 1
-
-            mention = f"<a href='tg://user?id={event.sender_id}'>User</a>"
-            message = f"{mention}\n{text}"
-
-            reply_mode = True
-
-            # Check if last bot message deleted
-            if data.get("last_bot_msg"):
-                try:
-                    await bot.get_messages(event.chat_id, ids=data["last_bot_msg"])
-                except:
-                    reply_mode = False
-
-            try:
-                if reply_mode:
-                    msg = await event.reply(message, parse_mode="html")
-                else:
-                    msg = await bot.send_message(
-                        event.chat_id,
-                        message,
-                        parse_mode="html"
-                    )
-
-                data["last_bot_msg"] = msg.id
-
-            except:
-                pass
-
-            await asyncio.sleep(attack_speed)
-
-
-    # ================= TROLL MODE =================
-    if event.sender_id in troll_targets:
-
-        texts = cursor.execute(
-            "SELECT text FROM tsave ORDER BY id ASC"
-        ).fetchall()
-
-        if texts:
-
-            data = troll_targets[event.sender_id]
-            text = texts[data["index"] % len(texts)][0]
-            data["index"] += 1
-
-            try:
-                await event.reply(text)
-            except:
-                pass
-
-            await asyncio.sleep(attack_speed)
-
-# ==========================
-# GLOBAL VARIABLES
-# ==========================
-delete_targets = {}  # {target_id: chat_id}
-
-# ==========================
-# /delete COMMAND
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^စာဖျက်လိုက်"))
-async def set_delete(event):
-    if not (is_owner(event.sender_id) or is_admin(event.sender_id)):
-        return await event.reply("မင်းမှာ Permission မရှိတဲ့အတွက်သုံးလို့မရဘူးငါ့ညီ ❌")
-
-    if not event.is_reply:
-        return await event.reply("⚠️ Reply to target user to activate delete mode.")
-
-    reply_msg = await event.get_reply_message()
-    target_id = reply_msg.sender_id
-
-    # OWNER IMMUNITY
-    if is_owner(target_id):
-        return await event.reply("⚠️ Cannot target the owner.")
-
-    delete_targets[target_id] = event.chat_id
-    await event.reply("✅ Delete mode activated for this user.")
-
-# ==========================
-# /undelete COMMAND (reply optional)
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^စာပေးရေးလိုက်(?:\s+(\d+|all))?"))
-async def unset_delete(event):
-    if not (is_owner(event.sender_id) or is_admin(event.sender_id)):
-        return await event.reply("မင်းမှာ Permission မရှိတဲ့အတွက်သုံးလို့မရဘူးငါ့ညီ ❌")
-
-    # If reply exists → use reply_msg.sender_id
-    target_id = None
-    if event.is_reply:
-        reply_msg = await event.get_reply_message()
-        if reply_msg:
-            target_id = reply_msg.sender_id
-    else:
-        # If /undelete <user_id> or /undelete all
-        arg = event.pattern_match.group(1)
-        if arg:
-            if arg.lower() == "all":
-                delete_targets.clear()
-                return await event.reply("✅ All delete targets removed.")
-            else:
-                try:
-                    target_id = int(arg)
-                except:
-                    return await event.reply("⚠️ Invalid user ID.")
-
-    if target_id:
-        if target_id in delete_targets:
-            del delete_targets[target_id]
-            await event.reply(f"✅ Delete mode removed for user {target_id}.")
-        else:
-            await event.reply("⚠️ This user is not in delete mode.")
-    else:
-        await event.reply("⚠️ Reply to a user or provide user ID to remove delete mode.")
-
-# ==========================
-# AUTO DELETE MONITOR
-# ==========================
-@bot.on(events.NewMessage(incoming=True))
-async def auto_delete_monitor(event):
-    if event.sender_id is None:
-        return
-
-    chat_id = event.chat_id
-
-    # Skip owner messages
-    if is_owner(event.sender_id):
-        return
-
-    # Collect target users + all bots in this chat
-    target_ids = list(delete_targets.keys())  # target users
-    async for user in bot.iter_participants(chat_id):
-        if user.bot:
-            target_ids.append(user.id)
-
-    # If sender is a target user or a bot → delete message
-    if event.sender_id in target_ids:
+async def is_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+    if user.id == OWNER_ID or user.id in db.authorized_users:
+        return True
+    
+    chat = update.effective_chat
+    if chat.type != "private":
         try:
-            await bot.delete_messages(chat_id, event.id)
-        except Exception as e:
-            print(f"Failed to delete message: {e}")
-
-    # Delete messages replying to target users
-    if event.is_reply:
-        reply_msg = await event.get_reply_message()
-        if reply_msg and reply_msg.sender_id in delete_targets:
-            try:
-                await bot.delete_messages(chat_id, event.id)
-            except Exception as e:
-                print(f"Failed to delete reply: {e}")
-
-# ==========================
-# ATT STORAGE
-# ==========================
-att_targets = {}  # user_id -> chat_id mapping
-
-# ==========================
-# /ATT (BOT ADMIN ONLY)
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^ထိန်းချုပ်လိုက်$"))
-async def set_att(event):
-    try:
-        # Only Bot Owner or Bot Admin can use
-        if not is_bot_admin(event.sender_id) and not is_owner(event.sender_id):
-            return await event.reply("မင်းမှာ Permission မရှိတဲ့အတွက်သုံးလို့မရဘူးငါ့ညီ ❌")
-
-        if not event.is_reply:
-            return await event.reply("⚠️ Target User ကို Reply လုပ်ပါ။")
-
-        reply_msg = await event.get_reply_message()
-        target_id = reply_msg.sender_id
-
-        # Owner cannot be muted
-        if is_owner(target_id):
-            return await event.reply("Bot Owner အပေါ်ကိုသက်ရောက်မှုမရှိတဲ့အတွက်သုံးလို့မရပါ❌")
-
-        # Add to ATT system
-        att_targets[target_id] = event.chat_id
-        await event.reply("✅ User ကို 10s Auto Mute System ထဲထည့်လိုက်ပါပြီ။")
-
-    except Exception as e:
-        print("ATT / ERROR:", e)
-        await event.reply("⚠️ Bot မှာ တစ်စုံတစ်ရာ အမှားဖြစ်နေပါတယ်။ Admin ကို contact လုပ်ပါ။")
-
-# ==========================
-# /UNATT (BOT ADMIN ONLY)
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^လွတ်ပေးလိုက်$"))
-async def unset_att(event):
-    try:
-        if not is_bot_admin(event.sender_id) and not is_owner(event.sender_id):
-            return await event.reply("မင်းမှာ Permission မရှိတဲ့အတွက်သုံးလို့မရဘူးငါ့ညီရေ ❌")
-
-        if not event.is_reply:
-            return await event.reply("⚠️ Target User ကို Reply လုပ်ပါ။")
-
-        reply_msg = await event.get_reply_message()
-        target_id = reply_msg.sender_id
-
-        if target_id in att_targets:
-            del att_targets[target_id]
-            await event.reply("✅ User ကို Control System မှ ဖယ်ရှားလိုက်ပါပြီ။")
-        else:
-            await event.reply("⚠️ ဒီ User Control List ထဲမှာမရှိပါ။")
-
-    except Exception as e:
-        print("UNATT / ERROR:", e)
-        await event.reply("⚠️ Bot မှာ တစ်စုံတစ်ရာ အမှားဖြစ်နေပါတယ်။ Admin ကို contact လုပ်ပါ။")
-
-# ==========================
-# AUTO CONTROL SYSTEM
-# ==========================
-@bot.on(events.NewMessage(incoming=True))
-async def monitor_att(event):
-    try:
-        user_id = event.sender_id
-        chat_id = event.chat_id
-
-        # Check if user is in ATT system for this chat
-        if user_id not in att_targets or att_targets[user_id] != chat_id:
-            return
-
-        # MUTE user for 10 seconds
-        await bot.edit_permissions(
-            chat_id,
-            user_id,
-            send_messages=False
-        )
-
-        await asyncio.sleep(10)
-
-        # UNMUTE user if still in ATT system
-        if user_id in att_targets:
-            await bot.edit_permissions(
-                chat_id,
-                user_id,
-                send_messages=True
-            )
-
-    except Exception as e:
-        print("AUTO CONTROL ERROR:", e)
-
-# ==========================
-# CALLING SYSTEM (Multi-Group Safe)
-# ==========================
-
-# store tasks and stop flags per chat
-calling_tasks = {}   # key = chat_id, value = asyncio.Task
-stop_flags = {}      # key = chat_id, value = bool
-
-# ==========================
-# /call COMMAND
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^အကုန်ခေါ်(?:@\w+)? (.+)"))
-async def start_calling(event):
-    chat_id = event.chat_id
-    text = event.pattern_match.group(1)
-
-    # Permission check
-    if not has_permission(event.sender_id):
-        return await event.reply("❌ Permission denied")
-
-    # Prevent duplicate task per group
-    if chat_id in calling_tasks and not calling_tasks[chat_id].done():
-        return await event.reply("⚠️ Calling already running in this group.")
-
-    stop_flags[chat_id] = False
-    calling_tasks[chat_id] = asyncio.create_task(calling_engine(chat_id, text))
-    await event.reply("🔊🔊‌ခေါ်ဆိုမှုကိုစတင်လိုက်ပါပီ (မခေါ်နဲ့တော့) ဖြင့်ရပ်တန့်လို့ရသည်....။")
-
-# ==========================
-# /stopcall COMMAND
-# ==========================
-@bot.on(events.NewMessage(pattern=r"မခေါ်နဲ့တော့$"))
-async def stop_call(event):
-    chat_id = event.chat_id
-
-    # Permission check
-    if not has_permission(event.sender_id):
-        return await event.reply("❌ Permission denied")
-
-    if chat_id in calling_tasks and not calling_tasks[chat_id].done():
-        stop_flags[chat_id] = True
-        await calling_tasks[chat_id]  # wait for task to finish
-        await event.reply("🔇🔇ခေါ်ဆိုမှုကိုရပ်တန့်လိုက်ပါပီ...။")
-    else:
-        await event.reply("⚠️ No calling task running in this group.")
-
-# ==========================
-# CALLING ENGINE
-# ==========================
-async def calling_engine(chat_id, text):
-    members = []
-    async for user in bot.iter_participants(chat_id):
-        members.append(user)
-
-    batch_size = 5        # 5 members per batch
-    delay_seconds = 2     # 2 seconds delay between batches
-    total_members = len(members)
-
-    for i in range(0, total_members, batch_size):
-        if stop_flags.get(chat_id):
-            break  # manual stop for this group
-
-        batch = members[i:i + batch_size]
-
-        mentions = [f"<a href='tg://user?id={user.id}'>{user.first_name}</a>" for user in batch]
-        message = " ".join(mentions) + "\n\n" + text
-
-        try:
-            await bot.send_message(chat_id, message, parse_mode="html")
-        except Exception as e:
-            print(f"Error sending batch in chat {chat_id}: {e}")
-
-        await asyncio.sleep(delay_seconds)
-
-    # Auto reset flag after finishing
-    stop_flags[chat_id] = False
-    calling_tasks.pop(chat_id, None)
-
-PAGE_SIZE = 50  # စာ 50 ခုချင်းပြ
-
-# ==========================
-# Runtime One-Time Permission (Memory Only)
-# ==========================
-permitted_users = set()
-
-
-# ==========================
-# /Setadd (Owner Only)
-# ==========================
-@bot.on(events.NewMessage(pattern=r"/Setadd"))
-async def setadd_user(event):
-    if event.sender_id != OWNER_ID:
-        return await event.reply("❌ Only owner can use /Setadd")
-
-    if not event.is_reply:
-        return await event.reply("❌ Reply to user to give permission")
-
-    reply = await event.get_reply_message()
-    user_id = reply.sender_id
-
-    permitted_users.add(user_id)
-    await event.reply("✅ One-time permission granted")
-
-
-# ==========================
-# /Unset (Owner Only)
-# ==========================
-@bot.on(events.NewMessage(pattern=r"/Unset"))
-async def unset_user(event):
-    if event.sender_id != OWNER_ID:
-        return await event.reply("❌ Only owner can use /Unset")
-
-    if not event.is_reply:
-        return await event.reply("❌ Reply to user to remove permission")
-
-    reply = await event.get_reply_message()
-    user_id = reply.sender_id
-
-    permitted_users.discard(user_id)
-    await event.reply("✅ Permission removed")
-
-
-# ==========================
-# Save Attack (One-Time)
-# ==========================
-@bot.on(events.NewMessage(pattern=r"/Asave (.+)"))
-async def save_attack(event):
-
-    # Owner အမြဲသုံးလို့ရ
-    if event.sender_id == OWNER_ID:
-        text = event.pattern_match.group(1)
-        cursor.execute("INSERT INTO asave(text) VALUES(?)", (text,))
-        conn.commit()
-        return await event.reply("✅ Attack text saved (owner)")
-
-    # Permission user တစ်ခါသုံး
-    if event.sender_id in permitted_users:
-        text = event.pattern_match.group(1)
-        cursor.execute("INSERT INTO asave(text) VALUES(?)", (text,))
-        conn.commit()
-
-        return await event.reply("✅ Attack text saved (permission used)")
-
-    await event.reply("❌ Permission denied")
-
-
-# ==========================
-# Save Troll (One-Time)
-# ==========================
-@bot.on(events.NewMessage(pattern=r"/Tsave (.+)"))
-async def save_troll(event):
-
-    # Owner အမြဲသုံးလို့ရ
-    if event.sender_id == OWNER_ID:
-        text = event.pattern_match.group(1)
-        cursor.execute("INSERT INTO tsave(text) VALUES(?)", (text,))
-        conn.commit()
-        return await event.reply("✅ Troll text saved (owner)")
-
-    # Permission user တစ်ခါသုံး
-    if event.sender_id in permitted_users:
-        text = event.pattern_match.group(1)
-        cursor.execute("INSERT INTO tsave(text) VALUES(?)", (text,))
-        conn.commit()
-
-        return await event.reply("✅ Troll text saved (permission used)")
-
-    await event.reply("❌ Permission denied")
-
-# ==========================
-# Generic Show Page Function
-# ==========================
-async def show_page(event, rows, page, title_prefix):
-    start = page * PAGE_SIZE
-    end = start + PAGE_SIZE
-    current_rows = rows[start:end]
-
-    if not current_rows:
-        await event.answer("No more pages.", alert=True)
-        return
-
-    msg_lines = [f"{r[0]}: {r[1]}" for r in current_rows]
-    msg_text = f"<blockquote>{title_prefix}\n\n" + "\n".join(msg_lines) + "</blockquote>"
-
-    buttons = []
-    if page > 0:
-        buttons.append(Button.inline("Previous", data=f"{title_prefix}_prev_{page-1}".encode()))
-    if end < len(rows):
-        buttons.append(Button.inline("Next", data=f"{title_prefix}_next_{page+1}".encode()))
-
-    await event.reply(msg_text, buttons=buttons, parse_mode="html")
-
-
-# ==========================
-# List Attack (/Alist)
-# ==========================
-@bot.on(events.NewMessage(pattern=r"/Alist"))
-async def list_attack(event):
-    rows = cursor.execute("SELECT id, text FROM asave").fetchall()
-    if not rows:
-        await event.reply("<blockquote>No attack texts saved.</blockquote>", parse_mode="html")
-        return
-    await show_page(event, rows, 0, "Attack List")
-
-
-# ==========================
-# List Troll (/Tlist)
-# ==========================
-@bot.on(events.NewMessage(pattern=r"/Tlist"))
-async def list_troll(event):
-    rows = cursor.execute("SELECT id, text FROM tsave").fetchall()
-    if not rows:
-        await event.reply("<blockquote>No troll texts saved.</blockquote>", parse_mode="html")
-        return
-    await show_page(event, rows, 0, "Troll List")
-
-
-# ==========================
-# Pagination Handler
-# ==========================
-@bot.on(events.CallbackQuery(pattern=b"(Attack List|Troll List)_(prev|next)_(\\d+)"))
-async def paginate(event):
-    # Decode bytes → str
-    title, action, page = [x.decode() if isinstance(x, bytes) else x for x in event.pattern_match.groups()]
-    page = int(page)
-
-    if "Attack" in title:
-        rows = cursor.execute("SELECT id, text FROM asave").fetchall()
-    else:
-        rows = cursor.execute("SELECT id, text FROM tsave").fetchall()
-
-    start = page * PAGE_SIZE
-    end = start + PAGE_SIZE
-    current_rows = rows[start:end]
-    if not current_rows:
-        await event.answer("No more pages.", alert=True)
-        return
-
-    msg_lines = [f"{r[0]}: {r[1]}" for r in current_rows]
-    msg_text = f"<blockquote>{title}\n\n" + "\n".join(msg_lines) + "</blockquote>"
-
-    buttons = []
-    if page > 0:
-        buttons.append(Button.inline("Previous", data=f"{title}_prev_{page-1}".encode()))
-    if end < len(rows):
-        buttons.append(Button.inline("Next", data=f"{title}_next_{page+1}".encode()))
-
-    await event.edit(msg_text, buttons=buttons, parse_mode="html")
-    await event.answer()
-
-# ==========================
-# /SENDS COMMAND (Owner Only + Auto Group Tracking)
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^ဖြန့်လိုက်$"))
-async def sends_command(event):
-    if event.sender_id != OWNER_ID:
-        return await event.reply("❌ Owner Only.")
-
-    if not event.is_reply:
-        return await event.reply("Reply to a message to forward.")
-
-    reply_msg = await event.get_reply_message()
-
-    shared_count = 0
-    failed_count = 0
-
-    status_msg = await event.reply("📤 Forwarding started...")
-
-    # Load all active groups from DB
-    cursor.execute("SELECT chat_id FROM active_groups")
-    groups = [row[0] for row in cursor.fetchall()]
-
-    for group_id in groups:
-        try:
-            await bot.forward_messages(group_id, reply_msg)
-            shared_count += 1
-            await asyncio.sleep(1)
-        except Exception as e:
-            failed_count += 1
-            continue
-
-        await status_msg.edit(
-            f"📤 Forwarding in progress...\n"
-            f"✅ Success: {shared_count}\n"
-            f"❌ Failed: {failed_count}\n"
-            f"⏳ Remaining: {len(groups) - (shared_count + failed_count)}"
-        )
-
-    await status_msg.edit(
-        f"✅ Forwarding completed!\n"
-        f"📦 Forwarded to: {shared_count} groups\n"
-        f"❌ Failed: {failed_count} groups"
-    )
-
-# ==========================
-# AUTO TRACK GROUPS (Any command used)
-# ==========================
-@bot.on(events.NewMessage)
-async def track_groups(event):
-    chat = await event.get_chat()
-    chat_id = chat.id
-
-    # Only track group chats
-    if not getattr(chat, "megagroup", False) and not getattr(chat, "gigagroup", False) and not getattr(chat, "broadcast", False):
-        return
-
-    # Check if already stored
-    cursor.execute("SELECT chat_id FROM active_groups WHERE chat_id = ?", (chat_id,))
-    if cursor.fetchone() is None:
-        cursor.execute("INSERT INTO active_groups(chat_id) VALUES(?)", (chat_id,))
-        conn.commit()
-        print(f"📌 New active group tracked: {chat.title} ({chat_id})")
-
-# ==========================
-# Chat Info Command (Clean Quote Box)
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^groupid"))
-async def chat_info(event):
-    chat = await event.get_chat()
-
-    admins = await bot.get_participants(chat, filter=ChannelParticipantsAdmins)
-
-    admin_text = ""
-    for idx, a in enumerate(admins, start=1):
-        admin_text += f"{idx}. {a.first_name}\n   {a.id}\n"
-
-    if getattr(chat, 'megagroup', False) or getattr(chat, 'broadcast', False):
-        group_id_display = f"-100{chat.id}"
-    else:
-        group_id_display = str(chat.id)
-
-    msg = (
-        "<blockquote>"
-        f"Group Name: {chat.title}\n"
-        f"Group ID: {group_id_display}\n\n"
-        f"Admins:\n{admin_text}"
-        "</blockquote>"
-    )
-
-    await event.reply(msg, parse_mode="html")
-
-# ==========================
-# User Info Command (No Emoji, Quote Box)
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^သူ့စောက်ကြောင်း"))
-async def acc_info(event):
-
-    if not event.is_reply:
-        return await event.reply("User ကို reply လုပ်ပါ")
-
-    reply_msg = await event.get_reply_message()
-    user = await bot.get_entity(reply_msg.sender_id)
-
-    # Status check
-    status = "Owner" if is_owner(user.id) else \
-             "Admin" if is_admin(user.id) else "Member"
-
-    username = f"@{user.username}" if user.username else "No Username"
-
-    msg = (
-        "<blockquote>"
-        f"Name: {user.first_name}\n"
-        f"ID: {user.id}\n"
-        f"Username: {username}\n"
-        f"Status: {status}"
-        "</blockquote>"
-    )
-
-    await event.reply(msg, parse_mode="html")
-
-@bot.on(events.NewMessage(pattern=r"/gplist"))
-async def group_list(event):
-    # SQLite ထဲမှာ groups table ထည့်ထားသင့်သည်
-    cursor.execute("""CREATE TABLE IF NOT EXISTS groups(id INTEGER PRIMARY KEY)""")
-    rows = cursor.execute("SELECT id FROM groups").fetchall()
-    if rows:
-        msg = "\n".join([str(r[0]) for r in rows])
-        await event.reply(f"📂 Groups:\n{msg}")
-    else:
-        await event.reply("No groups saved.")
-
-from telethon import events
-
-@bot.on(events.NewMessage(pattern=r"/Botadmlist"))
-async def list_admins(event):
-    rows = cursor.execute("SELECT id FROM bot_admins").fetchall()
-
-    if not rows:
-        await event.reply("<blockquote>⚠️ No Bot Admins assigned.</blockquote>", parse_mode="html")
-        return
-
-    msg_lines = []
-    for r in rows:
-        try:
-            user = await bot.get_entity(r[0])
-            name = user.first_name or "Unknown"
-            msg_lines.append(f"{name} — {user.id}")
-        except Exception:
-            msg_lines.append(f"Unknown — {r[0]}")
-
-    msg_text = "<blockquote>👮 Bot Admins:\n\n" + "\n".join(msg_lines) + "</blockquote>"
-
-    await event.reply(msg_text, parse_mode="html")
-
-# ==========================
-# ADMIN ADD (မှတ်လိုက်)
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^မှတ်လိုက်$"))
-async def add_admin(event):
-
-    if not is_owner(event.sender_id):
-        return await event.reply("Owner only command")
-
-    if not event.is_reply:
-        return await event.reply("User ကို Reply လုပ်ပါ")
-
-    reply = await event.get_reply_message()
-    uid = reply.sender_id
-
-    if uid in protected_users:
-        return await event.reply("ဒီ user ကို admin မလုပ်နိုင်ပါ")
-
-    cursor.execute("INSERT OR IGNORE INTO bot_admins(user_id) VALUES(?)", (uid,))
-    conn.commit()
-
-    await event.reply(f"User {uid} ကို Bot Admin အဖြစ်ထည့်လိုက်ပါပြီသခင်")
-
-# ==========================
-# ADMIN REMOVE (ဖြုတ်လိုက်)
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^ဖြုတ်လိုက်$"))
-async def remove_admin(event):
-
-    if not is_owner(event.sender_id):
-        return await event.reply("Owner only command")
-
-    if not event.is_reply:
-        return await event.reply("User ကို Reply လုပ်ပါ")
-
-    reply = await event.get_reply_message()
-    uid = reply.sender_id
-
-    cursor.execute("DELETE FROM bot_admins WHERE user_id=?", (uid,))
-    conn.commit()
-
-    await event.reply(f"User {uid} ကို Bot Admin မှ ဖယ်ရှားလိုက်ပါပြီသခင်")
-
-@bot.on(events.ChatAction)
-async def bot_added(event):
-    if event.user_added:
-        me = await bot.get_me()
-
-        if event.user_id == me.id and event.action_message:
-            adder = await bot.get_entity(event.action_message.from_id)
-
-            bot_name = me.first_name
-            adder_mention = f"<a href='tg://user?id={adder.id}'>{adder.first_name}</a>"
-
-            await event.reply(
-                "<blockquote>"
-                f"နတ်ဘုရားတစ်ပါးလို့လူသိများတဲ့ {bot_name} ရောက်ရှိလာပါပီ {adder_mention} လျှပ်စီးလိုမြန်ဆန်တဲ့တိုက်ခိုက်မှုကိုစတင်ရန် (သတ်ပလိုက်))Reply Or Uuser အသုံးပြုပါ.....။ "
-                "</blockquote>",
-                parse_mode="html",
-                link_preview=False
-            )
-
-
-# ==========================
-# အကူအညီ COMMAND (အသေးစိတ် Version)
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^အကူအညီ$"))
-async def helps_command(event):
-
-    help_text = (
-        "<blockquote>"
-        "BOT COMMANDS GUIDE (အသေးစိတ်)\n"
-        "════════════════════════\n\n"
-
-        "1. Attack & Spam Commands\n"
-        "─────────────────────────\n"
-        "• သတ်ပလိုက်  → User တစ်ယောက်ကို Spam စတင်ရန်\n"
-        "    (Reply လုပ်ပြီးသုံးလို့ရ၊ မလုပ်ဘဲလည်းရ)\n"
-        "• ရပ်တော့  → လက်ရှိ Spam အားလုံး ရပ်ရန်\n"
-        "• အရှိန် <time>  → Spam ပို့တဲ့ အမြန်နှုန်း သတ်မှတ်ရန်\n"
-        "    ဥပမာ - 0.5 / 0.1 / 0.01\n"
-        "    (0.1 အောက်ဆို Auto Speed Mode ဖြစ်သွားမည်)\n\n"
-
-        "• /Asave  → Spam ပို့မယ့် စာသားကို သိမ်းရန်\n"
-        "• /Alist  → သိမ်းထားတဲ့ Spam စာတွေကို ကြည့်ရန်\n"
-        "• /Rsave  → Reply Spam စာသား သိမ်းရန်\n"
-        "• /Rlist  → Reply Spam စာတွေကို ကြည့်ရန်\n"
-        "• /Tsave  → Troll Reply စာသား သိမ်းရန်\n"
-        "• /Tlist  → Troll စာတွေကို ကြည့်ရန်\n\n"
-
-        "2. Auto Reply System\n"
-        "─────────────────────────\n"
-        "• လွတ်အောင်ပြေး  → User တစ်ယောက်ကို Auto Reply စတင်ရန်\n"
-        "    (User message ကို Reply လုပ်ပြီးမှ သုံးရမည်)\n"
-        "• ပေးနားလိုက်  → Auto Reply ကို ရပ်ရန်\n"
-        "    (Reply user အတွက်သာ အလုပ်လုပ်မည်)\n\n"
-
-        "3. Troll System\n"
-        "─────────────────────────\n"
-        "• ရိုက်သတ်  → Troll Spam စတင်ရန်\n"
-        "• ခွင့်လွတ်လိုက်  → Troll Spam ရပ်ရန်\n\n"
-
-        "4. Message Control\n"
-        "─────────────────────────\n"
-        "• စာဖျက်လိုက်  → Reply လုပ်ထားတဲ့ message ကို Auto Delete လုပ်မည်\n"
-        "• စာပေးရေးလိုက်  → Delete Function ကို ပိတ်ရန်\n\n"
-
-        "5. Group Functions\n"
-        "─────────────────────────\n"
-        "• အကုန်ခေါ် <text>  → Group Member အားလုံးကို mention လုပ်ပြီး message ပို့ရန်\n"
-        "• မခေါ်နဲ့တော့  → Mention Function ကို ရပ်ရန်\n"
-        "• ဖျက်ချလိုက်  → Group Member အားလုံးကို Ban လုပ်ရန် (Admin Only)\n\n"
-        "• ဖြန့်လိုက် - Group တွေထဲကို Post ဖြန့်ရန်\n\n"
-        "• /gplist - Group List ကြည့်ရန်\n\n"
-
-        "6. CTC Reply System\n"
-        "─────────────────────────\n"
-        "• စလိုက် <id1> <id2>\n"
-        "    → User1 message ရေးတိုင်း User2 ကို mention လုပ်မည်\n"
-        "• တော်တော့  → ဒီ system ကို ပိတ်ရန်\n\n"
-
-        "7. Moderation Commands\n"
-        "─────────────────────────\n"
-        "• /ban  → Reply User ကို Group မှ Ban လုပ်ရန်\n"
-        "• /unban  → Ban ဖြုတ်ရန်\n"
-        "• /mute <time>  → User ကို အချိန်တစ်ခုအထိ စာရေးမရအောင်လုပ်ရန်\n"
-        "    ဥပမာ - 10m / 1h / 1d\n"
-        "• /unmute  → Mute ကို ချက်ချင်းဖြုတ်ရန်\n\n"
-
-        "8. Filter System\n"
-        "─────────────────────────\n"
-        "• /filter <trigger> <reply>\n"
-        "    → User က trigger စာရေးလျှင် Bot က reply အလိုအလျောက်ပြန်မည်\n"
-        "    ဥပမာ - /filter hi hello\n\n"
-
-        "9. Control System\n"
-        "─────────────────────────\n"
-        "• ထိန်းချုပ်လိုက်  → User တစ်ယောက် message ရေးတိုင်း 10 sec mute\n"
-        "• လွတ်ပေးလိုက်  → Control System ကို ရပ်ရန်\n\n"
-
-        "10. Translation\n"
-        "─────────────────────────\n"
-        "• ဘာသာပြန်မယ်  → စာသားကို ဘာသာပြန်ပေးမည် (120+ languages)\n\n"
-
-        "11. Info Commands\n"
-        "─────────────────────────\n"
-        "• သူ့စောက်ကြောင်း <id/user>  → User Info အသေးစိတ်ကြည့်ရန်\n"
-        "• groupid  → လက်ရှိ Group ID ကြည့်ရန်\n"
-        "• /Example  → Bot အလုပ်လုပ်နေမှု / status ကြည့်ရန်\n\n"
-
-        "12. Admin Control\n"
-        "─────────────────────────\n"
-        "• မှတ်လိုက်  → User ကို Bot Admin အဖြစ် ထည့်ရန်\n"
-        "• ဖြုတ်လိုက်  → Bot Admin မှ ဖြုတ်ရန်\n\n"
-        "√ /Botadminlist - Bot Admin List Show\n\n"
-
-        "13. Report System\n"
-        "─────────────────────────\n"
-        "• /Report  → စည်းကမ်းမဲ့ User ကို Report လုပ်ရန်\n\n"
-
-        "14. Extra Features\n"
-        "─────────────────────────\n"
-        "• Group Member Count ကို Auto ပြမည်\n"
-        "• Admin Count ကို Auto Track လုပ်မည်\n"
-        "• Spam Speed Limit Protection ပါရှိ\n"
-        "• Emoji Support ပါရှိ\n\n"
-
-        "════════════════════════\n"
-        "ဒီ (အကူအညီ) command ကို လူတိုင်း အသုံးပြုနိုင်ပါသည်\n"
-        "</blockquote>"
-    )
-
-    await event.reply(help_text, parse_mode="html")
-
-LANGUAGES = {
-    "Afrikaans": "af",
-    "Albanian": "sq",
-    "Amharic": "am",
-    "Arabic": "ar",
-    "Armenian": "hy",
-    "Azerbaijani": "az",
-    "Basque": "eu",
-    "Belarusian": "be",
-    "Bengali": "bn",
-    "Bosnian": "bs",
-    "Bulgarian": "bg",
-    "Catalan": "ca",
-    "Cebuano": "ceb",
-    "Chinese (Simplified)": "zh-cn",
-    "Chinese (Traditional)": "zh-tw",
-    "Corsican": "co",
-    "Croatian": "hr",
-    "Czech": "cs",
-    "Danish": "da",
-    "Dutch": "nl",
-    "English": "en",
-    "Esperanto": "eo",
-    "Estonian": "et",
-    "Finnish": "fi",
-    "French": "fr",
-    "Frisian": "fy",
-    "Galician": "gl",
-    "Georgian": "ka",
-    "German": "de",
-    "Greek": "el",
-    "Gujarati": "gu",
-    "Haitian Creole": "ht",
-    "Hausa": "ha",
-    "Hawaiian": "haw",
-    "Hebrew": "he",
-    "Hindi": "hi",
-    "Hmong": "hmn",
-    "Hungarian": "hu",
-    "Icelandic": "is",
-    "Igbo": "ig",
-    "Indonesian": "id",
-    "Irish": "ga",
-    "Italian": "it",
-    "Japanese": "ja",
-    "Javanese": "jw",
-    "Kannada": "kn",
-    "Kazakh": "kk",
-    "Khmer": "km",
-    "Korean": "ko",
-    "Kurdish (Kurmanji)": "ku",
-    "Kyrgyz": "ky",
-    "Lao": "lo",
-    "Latin": "la",
-    "Latvian": "lv",
-    "Lithuanian": "lt",
-    "Luxembourgish": "lb",
-    "Macedonian": "mk",
-    "Malagasy": "mg",
-    "Malay": "ms",
-    "Malayalam": "ml",
-    "Maltese": "mt",
-    "Maori": "mi",
-    "Marathi": "mr",
-    "Mongolian": "mn",
-    "Myanmar": "my",
-    "Nepali": "ne",
-    "Norwegian": "no",
-    "Nyanja (Chichewa)": "ny",
-    "Odia (Oriya)": "or",
-    "Pashto": "ps",
-    "Persian": "fa",
-    "Polish": "pl",
-    "Portuguese": "pt",
-    "Punjabi": "pa",
-    "Romanian": "ro",
-    "Russian": "ru",
-    "Samoan": "sm",
-    "Scots Gaelic": "gd",
-    "Serbian": "sr",
-    "Sesotho": "st",
-    "Shona": "sn",
-    "Sindhi": "sd",
-    "Sinhala (Sinhalese)": "si",
-    "Slovak": "sk",
-    "Slovenian": "sl",
-    "Somali": "so",
-    "Spanish": "es",
-    "Sundanese": "su",
-    "Swahili": "sw",
-    "Swedish": "sv",
-    "Tagalog (Filipino)": "tl",
-    "Tajik": "tg",
-    "Tamil": "ta",
-    "Tatar": "tt",
-    "Telugu": "te",
-    "Thai": "th",
-    "Turkish": "tr",
-    "Turkmen": "tk",
-    "Ukrainian": "uk",
-    "Urdu": "ur",
-    "Uyghur": "ug",
-    "Uzbek": "uz",
-    "Vietnamese": "vi",
-    "Welsh": "cy",
-    "Xhosa": "xh",
-    "Yiddish": "yi",
-    "Yoruba": "yo",
-    "Zulu": "zu"
-}
-
-# Session store for users
-user_state = {}
-
-# =========================
-# /translate Command
-# =========================
-@bot.on(events.NewMessage(pattern=r'^ဘာသာပြန်မယ်$', incoming=True))
-async def translate_cmd(event):
-    if not event.is_reply:
-        return await event.reply("Reply ထောက်ပြီး /translate သုံးပါ")
-
-    reply_msg = await event.get_reply_message()
-    if not reply_msg.text:
-        return await event.reply("Text မရှိပါ")
-
-    user_state[event.sender_id] = {
-        "original": reply_msg.text,
-        "waiting_language": True
-    }
-
-    await event.reply(
-        "🌐 ဘာသာစကားနာမည် ရိုက်ပါ (ဥပမာ: English, Japanese, Myanmar (Burmese))"
-    )
-
-# =========================
-# Language Input & Pagination
-# =========================
-@bot.on(events.NewMessage(incoming=True))
-async def language_input(event):
-    user_id = event.sender_id
-    if user_id not in user_state:
-        return
-    if not user_state[user_id].get("waiting_language"):
-        return
-
-    lang_name = event.text.strip()
-    if lang_name not in LANGUAGES:
-        return await event.reply(
-            "❌ Language မမှန်ပါ။ English / Japanese / Myanmar (Burmese) လို အပြည့်အစုံရိုက်ပါ"
-        )
-
-    lang_code = LANGUAGES[lang_name]
-    original = user_state[user_id]["original"]
-    translated = translator.translate(original, dest=lang_code).text
-
-    # Store pages
-    user_state[user_id]["waiting_language"] = False
-    user_state[user_id]["pages"] = [
-        f"<blockquote>Original Message:\n{original}</blockquote>",
-        f"<blockquote>Translated ({lang_name}):\n{translated}</blockquote>"
-    ]
-    user_state[user_id]["current_page"] = 0
-
-    # Send first page with buttons
-    await event.reply(
-        user_state[user_id]["pages"][0],
-        parse_mode="html",
-        buttons=[
-            [Button.inline("Next ▶", data=f"next_{user_id}")]
-        ]
-    )
-
-# =========================
-# Button Callback Handler
-# =========================
-@bot.on(events.CallbackQuery)
-async def page_callback(event):
-    data = event.data.decode("utf-8")
-    user_id = int(data.split("_")[-1])
-    if user_id not in user_state:
-        return await event.answer("Session expired ❌", alert=True)
-
-    page_data = user_state[user_id]
-    current = page_data["current_page"]
-
-    if data.startswith("next"):
-        next_page = current + 1
-        if next_page >= len(page_data["pages"]):
-            return await event.answer("End of pages ❌", alert=True)
-        page_data["current_page"] = next_page
-
-        if next_page == 1:
-            buttons = [
-                [Button.inline("◀ Previous", data=f"prev_{user_id}")]
-            ]
-        else:
-            buttons = [
-                [Button.inline("◀ Previous", data=f"prev_{user_id}"),
-                 Button.inline("Next ▶", data=f"next_{user_id}")]
-            ]
-
-        await event.edit(
-            page_data["pages"][next_page],
-            parse_mode="html",
-            buttons=buttons
-        )
-
-    elif data.startswith("prev"):
-        prev_page = current - 1
-        if prev_page < 0:
-            return await event.answer("Start of pages ❌", alert=True)
-        page_data["current_page"] = prev_page
-
-        if prev_page == 0:
-            buttons = [
-                [Button.inline("Next ▶", data=f"next_{user_id}")]
-            ]
-        else:
-            buttons = [
-                [Button.inline("◀ Previous", data=f"prev_{user_id}"),
-                 Button.inline("Next ▶", data=f"next_{user_id}")]
-            ]
-
-        await event.edit(
-            page_data["pages"][prev_page],
-            parse_mode="html",
-            buttons=buttons
-        )
-
-# ==========================
-# BAN / UNBAN / MUTE / UNMUTE
-# ==========================
-
-# Helper for time parsing
-def parse_time(text):
-    seconds = 0
-    if text:
-        match = re.match(r"(\d+)([mhd])", text.lower())
-        if match:
-            num, unit = match.groups()
-            num = int(num)
-            if unit == "m":
-                seconds = num * 60
-            elif unit == "h":
-                seconds = num * 3600
-            elif unit == "d":
-                seconds = num * 86400
-    else:
-        seconds = 600  # default 10m
-    return seconds
-
-# ==========================
-# /BAN
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^/ban$"))
-async def ban_user(event):
-
-    if not (is_owner(event.sender_id) or is_bot_admin(event.sender_id)):
-        return await event.reply("❌ Admin only.")
-
-    if not event.is_reply:
-        return await event.reply("⚠️ Reply to the user you want to ban.")
-
-    # -------- BOT PERMISSION CHECK --------
-    perms = await bot.get_permissions(event.chat_id, "me")
-
-    if not perms.is_admin:
-        return await event.reply("⚠️ Bot က Admin မဟုတ်ပါ။")
-
-    if not perms.ban_users:
-        return await event.reply("⚠️ Bot မှာ Ban Permission မရှိပါ။")
-
-    reply = await event.get_reply_message()
-    target = reply.sender_id
-
-    if is_owner(target):
-        return await event.reply("⚠️ Owner cannot be banned.")
-
-    try:
-        await bot.edit_permissions(
-            event.chat_id,
-            target,
-            view_messages=False
-        )
-
-        await event.reply("🚫 User banned successfully.")
-
-    except:
-        await event.reply("⚠️ Ban လုပ်လို့မရပါ။ Bot permission ကိုစစ်ပါ။")
-
-# ==========================
-# /UNBAN
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^/unban$"))
-async def unban_user(event):
-
-    if not (is_owner(event.sender_id) or is_bot_admin(event.sender_id)):
-        return await event.reply("❌ Admin only.")
-
-    if not event.is_reply:
-        return await event.reply("⚠️ Reply to the user you want to unban.")
-
-    # -------- BOT PERMISSION CHECK --------
-    perms = await bot.get_permissions(event.chat_id, "me")
-
-    if not perms.is_admin:
-        return await event.reply("⚠️ Bot က Admin မဟုတ်ပါ။")
-
-    if not perms.ban_users:
-        return await event.reply("⚠️ Bot မှာ Unban Permission မရှိပါ။")
-
-    reply = await event.get_reply_message()
-    target = reply.sender_id
-
-    try:
-        await bot.edit_permissions(
-            event.chat_id,
-            target,
-            view_messages=True,
-            send_messages=True
-        )
-
-        await event.reply("✅ User unbanned successfully.")
-
-    except:
-        await event.reply("⚠️ Unban လုပ်လို့မရပါ။ Bot permission ကိုစစ်ပါ။")
-
-# ==========================
-# /MUTE (with optional time)
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^/mute(?:\s+(.+))?$"))
-async def mute_user(event):
-
-    if not (is_owner(event.sender_id) or is_bot_admin(event.sender_id)):
-        return await event.reply("❌ Admin only.")
-
-    if not event.is_reply:
-        return await event.reply("⚠️ Reply to the user you want to mute.")
-
-    # -------- BOT PERMISSION CHECK --------
-    perms = await bot.get_permissions(event.chat_id, "me")
-
-    if not perms.is_admin:
-        return await event.reply("⚠️ Bot က Admin မဟုတ်ပါ။")
-
-    if not perms.ban_users:
-        return await event.reply("⚠️ Bot မှာ Mute Permission မရှိပါ။")
-
-    reply = await event.get_reply_message()
-    target = reply.sender_id
-
-    if is_owner(target):
-        return await event.reply("⚠️ Owner cannot be muted.")
-
-    text = event.pattern_match.group(1)
-    seconds = parse_time(text)
-
-    try:
-        await bot.edit_permissions(
-            event.chat_id,
-            target,
-            send_messages=False
-        )
-
-        await event.reply(f"🔇 User muted for {text if text else '10m'}")
-
-        if seconds > 0:
-            await asyncio.sleep(seconds)
-
-            await bot.edit_permissions(
-                event.chat_id,
-                target,
-                send_messages=True
-            )
-
-            try:
-                await event.reply(f"🔊 User auto unmuted after {text if text else '10m'}")
-            except:
-                pass
-
-    except:
-        await event.reply("⚠️ Mute လုပ်လို့မရပါ။ Bot permission ကိုစစ်ပါ။")
-
-
-# ==========================
-# /UNMUTE
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^/unmute$"))
-async def unmute_user(event):
-
-    if not (is_owner(event.sender_id) or is_bot_admin(event.sender_id)):
-        return await event.reply("❌ Admin only.")
-
-    if not event.is_reply:
-        return await event.reply("⚠️ Reply to the user you want to unmute.")
-
-    # -------- BOT PERMISSION CHECK --------
-    perms = await bot.get_permissions(event.chat_id, "me")
-
-    if not perms.is_admin:
-        return await event.reply("⚠️ Bot က Admin မဟုတ်ပါ။")
-
-    if not perms.ban_users:
-        return await event.reply("⚠️ Bot မှာ Unmute Permission မရှိပါ။")
-
-    reply = await event.get_reply_message()
-    target = reply.sender_id
-
-    try:
-        await bot.edit_permissions(
-            event.chat_id,
-            target,
-            send_messages=True
-        )
-
-        await event.reply("🔊 User manually unmuted")
-
-    except:
-        await event.reply("⚠️ Unmute လုပ်လို့မရပါ။ Bot permission ကိုစစ်ပါ။")
-
-# ===========================
-# SESSION STORAGE (LOCKED)
-# ===========================
-pending_promote = {}
-
-# ===========================
-# STEP 1: START PROMOTE
-# ===========================
-
-@bot.on(events.NewMessage(pattern=r"(?i)^တပ်မယ်$"))
-async def give_admin(event):
-
-    if event.sender_id != CREATOR_ID:
-        return await event.reply("❌ Creator only.")
-
-    if not event.is_reply:
-        return await event.reply("⚠️ Reply to a user.")
-
-    reply = await event.get_reply_message()
-    user = await reply.get_sender()
-
-    pending_promote[event.chat_id] = {
-        "caller": event.sender_id,
-        "target": user.id,
-        "active": True
-    }
-
-    await event.reply(
-        "🧠 Admin Title ဘာထားမလဲ?\n\n"
-    )
-
-# ===========================
-# STEP 2: TITLE INPUT + PROMOTE
-# ===========================
-
-@bot.on(events.NewMessage)
-async def set_admin_title(event):
-
-    chat_id = event.chat_id
-    text = event.raw_text.strip()
-
-    # ❌ NO SESSION
-    if chat_id not in pending_promote:
-        return
-
-    session = pending_promote[chat_id]
-
-    # ❌ NOT ACTIVE
-    if not session.get("active"):
-        return
-
-    # 🔒 ONLY COMMAND USER
-    if event.sender_id != session["caller"]:
-        return
-
-    # ❌ IGNORE COMMANDS (THIS FIXES YOUR BUG)
-    if text.startswith("/"):
-        return
-
-    # ❌ IGNORE STEP1 MESSAGE
-    if text == "ပေးလိုက်":
-        return
-
-    try:
-        user = await bot.get_entity(session["target"])
-        title = text
-
-        if not title:
-            return await event.reply("⚠️ Admin Title ထည့်ပါ။")
-
-        rights = ChatAdminRights(
-            change_info=True,
-            post_messages=True,
-            edit_messages=True,
-            delete_messages=True,
-            ban_users=True,
-            invite_users=True,
-            pin_messages=True,
-            add_admins=True,
-            anonymous=True,
-            manage_call=True
-        )
-
-        await bot(EditAdminRequest(
-            channel=chat_id,
-            user_id=user.id,
-            admin_rights=rights,
-            rank=title
-        ))
-
-        await event.reply(
-            f"✅ Successfully promoted:\n"
-            f"{user.first_name} → {title}"
-        )
-
-        del pending_promote[chat_id]
-
-    except Exception:
-        await event.reply("⚠️ Promotion failed.")
-        if chat_id in pending_promote:
-            del pending_promote[chat_id]
-
-# ==========================
-# /Filter
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^/filter"))
-async def add_filter(event):
-
-    if not (is_owner(event.sender_id) or is_bot_admin(event.sender_id)):
-        return await event.reply("❌ Admin only.")
-
-    args = event.raw_text.split(maxsplit=2)
-
-    if len(args) < 3:
-        return await event.reply("Usage:\n/Filter trigger reply")
-
-    trigger = args[1].lower()
-    reply = args[2]
-
-    cursor.execute(
-        "INSERT INTO filters (chat_id, trigger, reply) VALUES (?, ?, ?)",
-        (event.chat_id, trigger, reply)
-    )
-    conn.commit()
-
-    await event.reply(f"✅ Filter added\nTrigger : {trigger}")
-
-# ==========================
-# FILTER LISTENER
-# ==========================
-@bot.on(events.NewMessage(incoming=True))
-async def filter_reply(event):
-
-    if event.raw_text is None:
-        return
-
-    text = event.raw_text.lower()
-
-    cursor.execute(
-        "SELECT trigger, reply FROM filters WHERE chat_id=?",
-        (event.chat_id,)
-    )
-
-    rows = cursor.fetchall()
-
-    for trigger, reply in rows:
-
-        if text == trigger:
-            await event.reply(reply)
-            break
-
-ban_tracker = {}
-alert_lock = {}
-
-BAN_THRESHOLD = 2  # Minimum group members to trigger
-
-@bot.on(events.ChatAction)
-async def auto_owner_alert(event):
-    chat_id = event.chat_id
-
-    # Initialize trackers
-    if chat_id not in ban_tracker:
-        ban_tracker[chat_id] = []
-    if chat_id not in alert_lock:
-        alert_lock[chat_id] = False
-
-    # Detect Ban / Kick
-    if event.user_kicked:
-        banned_user = await event.get_user()
-
-        # Auto detect Owner
-        participants = await bot.get_participants(chat_id, filter=ChannelParticipantsAdmins)
-        owner = next((p for p in participants if getattr(p.participant, "creator", False)), None)
-        if not owner:
-            return
-        OWNER_ID = owner.id
-        OWNER_NAME = owner.first_name
-
-        # Skip Bot / Owner self-action
-        me = await bot.get_me()
-        if banned_by.id in [me.id, OWNER_ID]:
-            return
-
-        # Track banner
-        ban_tracker[chat_id].append(banned_by.first_name)
-
-        # Check total members
-        total_members = len(await bot.get_participants(chat_id))
-        if total_members <= BAN_THRESHOLD:
-            return
-
-        # Throttle Alert: send only once per 1 second
-        if not alert_lock[chat_id]:
-            alert_lock[chat_id] = True
-            banners_str = ", ".join(list(set(ban_tracker[chat_id])))
-            alert_msg = (
-                f"<blockquote>{OWNER_NAME} သတိပေးချက်\n\n"
-                f"{banners_str} က Group Members တွေကို Ban လုပ်နေပါတယ်။\n"
-                f"အထူးသတိပြုပါ။</blockquote>"
-            )
-            await bot.send_message(OWNER_ID, alert_msg, parse_mode="html")
-
-            # Reset lock after 1 second
-            await asyncio.sleep(1)
-            alert_lock[chat_id] = False
-            ban_tracker[chat_id] = []  # Clear tracker for next batch
-
-# =============================
-# Bot State
-# =============================
-ctc_active = False
-user1_id = None
-user2_id = None
-
-# =============================
-# /Ctc Command
-# =============================
-@bot.on(events.NewMessage(pattern=r'^စလိုက်'))
-async def start_ctc(event):
-    global ctc_active, user1_id, user2_id
-    sender = event.sender_id
-
-    if not (is_owner(sender) or is_admin(sender)):
-        await event.reply("❌ You are not allowed to use this command.")
-        return
-
-    # Parse Command
-    try:
-        parts = event.raw_text.split()
-        user1_id = int(parts[1])
-        user2_id = int(parts[2])
-    except:
-        await event.reply("❌ Usage: စလိုက် <user1_id> <user2_id>")
-        return
-
-    ctc_active = True
-    await event.reply(f" Trolling Mode Activated for {user1_id} & {user2_id}")
-
-# =============================
-# /Unctc Command
-# =============================
-@bot.on(events.NewMessage(pattern=r'^တော်တော့'))
-async def stop_ctc(event):
-    global ctc_active, user1_id, user2_id
-    sender = event.sender_id
-
-    if not (is_owner(sender) or is_admin(sender)):
-        await event.reply("❌ You are not allowed to use this command.")
-        return
-
-    ctc_active = False
-    user1_id = None
-    user2_id = None
-    await event.reply(" Trolling Mode Deactivated.")
-
-# =============================
-# Message Listener
-# =============================
-@bot.on(events.NewMessage(incoming=True))
-async def handle_message(event):
-    global user1_id, user2_id
-
-    if not ctc_active:
-        return
-
-    sender = event.sender_id
-    text = event.raw_text
-
-    # Only react to user1 or user2
-    if sender not in (user1_id, user2_id):
-        return
-
-    # Determine target
-    target_id = user2_id if sender == user1_id else user1_id
-    target_entity = await bot.get_entity(target_id)
-
-    # Reply & mention with original message content
-    await event.reply(f"{text} <a href='tg://user?id={target_entity.id}'>{target_entity.first_name}</a>", parse_mode="html")
-
-# =========================
-# Anti-Spam / Link Detection (Quote + Mention)
-# =========================
-@bot.on(events.NewMessage(incoming=True))
-async def anti_spam(event):
-    if event.is_private:
-        return
-
-    try:
-        sender = await event.get_sender()
-        if not sender:
-            return
-
-        # Skip admins / creator
-        perms = await bot.get_permissions(event.chat_id, sender.id)
-        if perms.is_creator or perms.is_admin:
-            return
-
-        text = (event.raw_text or "").lower()
-        is_forward = bool(event.forward)
-        is_link = any(word in text for word in LINK_WORDS)
-        is_mention = bool(re.search(r'@\w+', text))
-
-        if is_forward or is_link or is_mention:
-            try:
-                await event.delete()
-            except errors.ChatAdminRequiredError:
-                print("Bot needs delete permission")
-                return
-
-            chat = await event.get_chat()
-            name_mention = f"<a href='tg://user?id={sender.id}'>{sender.first_name}</a>"
-            chat_name = chat.title or "Group"
-
-            msg_text = (
-                f"<blockquote>{name_mention} ညီလေး {chat_name} မှာ စည်းကမ်းမရှိလာမလုပ်နဲ့ဖျက်ထိုးလိုက််မယ်\n"
-                "မင်းစာကိုဖျက်ပလိုက်ပီ ❌</blockquote>"
-            )
-
-            await event.reply(msg_text, parse_mode="html")
-
-    except Exception as e:
-        print("AntiSpam Error:", e)
-
-# ==========================
-# AUTO WELCOME SYSTEM
-# ==========================
-
-WELCOME_TEXT = """
-{mention_name} ကိုယ့်အိမ်ကိုယ့်ရာလိုပဲ သက်တောင့်သက်သာ နေထိုင်ပြီး Member သစ်မဟုတ်တော့ဘဲအမြဲရှိနေမယ့် Core Member တစ်ယောက်အဖြစ် တွေ့မြင်ချင်ပါတယ်။ Let’s create good memories together! 🥂🔥။
-
-Name - {mention_name}
-Id - {user_id}
-User - {user_name}
-Groups - {group}
-
-မင်းရောက်လာတာနဲ့ {groups_name} ရဲ့ VIBE က ပိုပြီး ပြည့်စုံသွားပြီ။ငါတို့ Group မှာ ရှိနေသမျှ ကာလပတ်လုံး ပျင်းရတယ်ဆိုတာ မရှိစေရဘူး၊ မိတ်ဆွေကောင်းတွေနဲ့ ရယ်မောပျော်ရွှင်စရာတွေပဲ ရှိမယ်!
-။
-"""
-
-@bot.on(events.ChatAction)
-async def auto_welcome(event):
-
-    # အသစ်ဝင်လာတဲ့ User တွေကိုသာ စစ်ပါ
-    if not (event.user_joined or event.user_added):
-        return
-
-    chat = await event.get_chat()
-    users = await event.get_users()
-
-    for user in users:
-
-        # User Info
-        name = user.first_name
-        user_id = user.id
-        user_mention = f"<a href='tg://user?id={user_id}'>{name}</a>"
-
-        if user.username:
-            user_name = "@" + user.username
-        else:
-            user_name = "None"
-
-        group_name = chat.title
-
-        text = WELCOME_TEXT
-        text = text.replace("{mention_name}", user_mention)
-        text = text.replace("{user_id}", str(user_id))
-        text = text.replace("{user_name}", user_name)
-        text = text.replace("{group}", group_name)
-        text = text.replace("{groups_name}", group_name)
-
-        # Message Send
-        await bot.send_message(
-            event.chat_id,
-            f"<blockquote>{text}</blockquote>",
-            parse_mode="html"
-        )
-
-# ==========================
-# Goodbye System (Friendly)
-# ==========================
-@bot.on(events.ChatAction)
-async def goodbye_user(event):
-    # Detect user left / kicked
-    if event.user_left or event.user_kicked:
-        try:
-            user = await bot.get_entity(event.user_id)
-            name_mention = f"<a href='tg://user?id={user.id}'>{user.first_name}</a>"
-
-            chat = await event.get_chat()
-            group_name = chat.title or "Group"
-
-            msg_text = (
-                f"<blockquote>{name_mention} ရေ <b>{group_name}</b> ကနေ ထွက်သွားပြီပေါ့... 🖤\n\n"
-                f"သွားလေရာရာမှာ အဆင်ပြေပါစေ။ ရောက်ရာနေရာမှာ အလင်းလက်ဆုံး Star တစ်ပါး ဖြစ်ပါစေလို့ "
-                f"<b>{group_name}</b> မိသားစုက ဆုတောင်းပေးလိုက်ပါတယ်။ 🚀</blockquote>"
-            )
-
-            await event.reply(msg_text, parse_mode="html")
+            member = await chat.get_member(user.id)
+            if member.status in ["administrator", "creator"]:
+                return True
         except Exception:
             pass
-
-
-# ==========================
-# AniList Functions
-# ==========================
-def fetch_anime_title(anilist_id: int):
-    """
-    Fetch anime title from AniList by ID
-    """
-    query = """
-    query ($id: Int) {
-      Media (id: $id, type: ANIME) {
-        title {
-          romaji
-          english
-          native
-        }
-      }
-    }
-    """
-    variables = {"id": anilist_id}
-    try:
-        response = requests.post(
-            "https://graphql.anilist.co",
-            json={"query": query, "variables": variables},
-            timeout=10
-        )
-        data = response.json()
-        media = data["data"]["Media"]
-        title = media["title"]["english"] or media["title"]["romaji"]
-        return title
-    except:
-        return "Unknown"
-
-def fetch_characters(anilist_id: int):
-    """
-    Fetch top 3 characters of the anime
-    """
-    query = """
-    query ($id: Int) {
-      Media (id: $id, type: ANIME) {
-        characters(sort: ROLE) {
-          edges {
-            node {
-              name {
-                full
-              }
-            }
-          }
-        }
-      }
-    }
-    """
-    variables = {"id": anilist_id}
-    try:
-        response = requests.post(
-            "https://graphql.anilist.co",
-            json={"query": query, "variables": variables},
-            timeout=10
-        )
-        data = response.json()
-        edges = data["data"]["Media"]["characters"]["edges"]
-        return [e["node"]["name"]["full"] for e in edges[:3]]  # top 3 characters
-    except:
-        return ["Unknown"]
-
-# ==========================
-# /Wa Command Handler
-# ==========================
-@bot.on(events.NewMessage(pattern=r"^နံမည်$"))
-async def wa_handler(event):
-    """
-    Handles /Wa command: replies to photo/video and searches anime
-    """
-    if not event.is_reply:
-        return await event.reply("❌ Reply to a Photo or Video.")
-
-    reply = await event.get_reply_message()
-    if not (reply.photo or reply.video):
-        return await event.reply("❌ Reply must be a Photo or Video.")
-
-    file_path = await reply.download_media()
-
-    try:
-        # Send image to trace.moe API
-        async with aiohttp.ClientSession() as session:
-            with open(file_path, "rb") as f:
-                data = aiohttp.FormData()
-                data.add_field("image", f)
-                async with session.post(TRACE_API, data=data) as resp:
-                    result = await resp.json()
-
-        if not result.get("result"):
-            return await event.reply("❌ No Anime Found.")
-
-        results = result["result"]
-        best = results[0]
-        similarity = best["similarity"]
-
-        # -------- EXACT MATCH (>=92%) --------
-        if similarity >= 0.92:
-            title = fetch_anime_title(best["anilist"])
-            characters = fetch_characters(best["anilist"])
-            text = (
-                f"<blockquote>❝ 𝗔𝗡𝗜𝗠𝗘 𝗗𝗘𝗧𝗘𝗖𝗧𝗘𝗗 ❞\n\n"
-                f"🎬 {title}\n"
-                f"👤 Main Characters: {', '.join(characters)}\n"
-                f"📺 Episode: {best.get('episode', 'Unknown')}\n"
-                f"🎯 Accuracy: {round(similarity*100,2)}%</blockquote>"
-            )
-            await event.reply(text, parse_mode="html")
-
-        # -------- CLOSE MATCH (TOP 5) --------
-        else:
-            text = "<blockquote>❝ 𝗣𝗢𝗦𝗦𝗜𝗕𝗟𝗘 𝗠𝗔𝗧𝗖𝗛𝗘𝗦 ❞\n\n"
-            for i, item in enumerate(results[:5], 1):
-                title = fetch_anime_title(item["anilist"])
-                characters = fetch_characters(item["anilist"])
-                sim = round(item["similarity"]*100,2)
-                text += f"{i}. {title} | Characters: {', '.join(characters)} ({sim}%)\n"
-            text += "</blockquote>"
-            await event.reply(text, parse_mode="html")
-
-    except Exception as e:
-        await event.reply(f"❌ Error: {e}")
-
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-
-# ===========================
-# SESSION STORAGE (LOCKED)
-# ===========================
-pending_promote = {}
-
-# ===========================
-# STEP 1: START PROMOTE
-# ===========================
-
-@bot.on(events.NewMessage(pattern=r"(?i)^ပေးလိုက်$"))
-async def give_admin(event):
-
-    # ✅ OWNER ONLY
-    if event.sender_id != OWNER_ID:
-        return await event.reply("❌ Owner only.")
-
-    if not event.is_reply:
-        return await event.reply("⚠️ Reply to a user.")
-
-    reply = await event.get_reply_message()
-    user = await reply.get_sender()
-
-    pending_promote[event.chat_id] = {
-        "caller": event.sender_id,
-        "target": user.id,
-        "active": True
-    }
-
-    await event.reply(
-        "🧠 Admin Title ဘာထားမလဲ?\n\n"
-        "ဥပမာ: Owner / Boss / Admin / Mod"
-    )
-
-# ===========================
-# STEP 2: TITLE INPUT + PROMOTE
-# ===========================
-
-@bot.on(events.NewMessage)
-async def set_admin_title(event):
-
-    chat_id = event.chat_id
-    text = event.raw_text.strip()
-
-    # ❌ NO SESSION
-    if chat_id not in pending_promote:
-        return
-
-    session = pending_promote[chat_id]
-
-    # ❌ NOT ACTIVE
-    if not session.get("active"):
-        return
-
-    # 🔒 ONLY OWNER WHO STARTED COMMAND
-    if event.sender_id != session["caller"]:
-        return
-
-    # ❌ IGNORE COMMANDS
-    if text.startswith("/"):
-        return
-
-    # ❌ IGNORE STEP1 MESSAGE
-    if text == "ပေးလိုက်":
-        return
-
-    try:
-        user = await bot.get_entity(session["target"])
-        title = text
-
-        if not title:
-            return await event.reply("⚠️ Admin Title ထည့်ပါ။")
-
-        rights = ChatAdminRights(
-            change_info=False,
-            post_messages=False,
-            edit_messages=False,
-            delete_messages=True,
-            ban_users=False,
-            invite_users=True,
-            pin_messages=True,
-            add_admins=False,
-            anonymous=False,
-            manage_call=True
-        )
-
-        await bot(EditAdminRequest(
-            channel=chat_id,
-            user_id=user.id,
-            admin_rights=rights,
-            rank=title
-        ))
-
-        await event.reply(
-            f"✅ Successfully promoted:\n"
-            f"{user.first_name} → {title}"
-        )
-
-        del pending_promote[chat_id]
-
-    except Exception as e:
-        await event.reply(f"⚠️ Promotion failed.\n\n{e}")
-
-        if chat_id in pending_promote:
-            del pending_promote[chat_id]
-
-# ==========================
-# AUTO ANTI-SPAM VARIABLES
-# 5 seconds / 4 messages → 20 seconds Mute
-# ==========================
-user_messages = defaultdict(list)
-
-@bot.on(events.NewMessage)
-async def auto_antispam(event):
-
-    if event.is_private:
-        return
-
-    user_id = event.sender_id
-    chat_id = event.chat_id
-    now = time.time()
-
-    # Bot Owner skip
-    if user_id == BOT_OWNER_ID:
-        return
-
-    # User message log
-    user_messages[user_id].append(now)
-
-    # 5 စက္ကန့်အတွင်း Messages
-    user_messages[user_id] = [t for t in user_messages[user_id] if now - t < 5]
-
-    # 4 messages ထက်ပိုရင် Spam
-    if len(user_messages[user_id]) >= 4:
-
-        try:
-            # 20 စက္ကန့် Mute
-            await bot.edit_permissions(
-                chat_id,
-                user_id,
-                send_messages=False
-            )
-
-            # Quote Box Warning
-            await event.reply(
-                f"<blockquote>⚠️ သတိပေးချက်\n"
-                f"<a href='tg://user?id={user_id}'>ဟိတ်</a>\n"
-                f"5 စက္ကန့်အတွင်း စာ ၄ ကြောင်း ဆက်တိုက် Spam လုပ်သဖြင့် 20 စက္ကန့်စာရေးခွင့် ပိတ်ထားပါသည်။\n"
-                f"Group စည်းကမ်းကိုလိုက်နာပါ။</blockquote>",
-                parse_mode="html",
-                reply_to=event.message.id
-            )
-
-            # 20 စက္ကန့်
-            await asyncio.sleep(20)
-
-            # Auto Unmute
-            await bot.edit_permissions(
-                chat_id,
-                user_id,
-                send_messages=True
-            )
-
-            await event.reply(
-                f"<blockquote><a href='tg://user?id={user_id}'>ဟိတ်</a> 20 စက္ကန့်ပြည့်ပြီး စာရေးနိုင်ပါပြီ။</blockquote>",
-                parse_mode="html",
-                reply_to=event.message.id
-            )
-
-        except Exception as e:
-            print(f"Anti-Spam Error: {e}")
-
-        user_messages[user_id] = []
-# ==========================
-# OWNER_ID Only Report System
-# ==========================
-
-@bot.on(events.NewMessage(pattern=r"(?i)^/report(?: |$)(.*)"))
-async def user_report(event):
-    """
-    Usage:
-    Reply to a user's message with:
-    /report <reason>
-    Report will be sent ONLY to OWNER_ID
-    """
-
-    if not event.is_reply:
-        await event.reply("Report လုပ်ချင်တဲ့ User ကို Reply လုပ်ပြီး /report <အကြောင်းပြချက်> ရိုက်ပါ။")
-        return
-
-    reported_user = await event.get_reply_message()
-    reporter_id = event.sender_id
-    reported_id = reported_user.sender_id
-    reason = event.pattern_match.group(1).strip()
-    if not reason:
-        reason = "No reason provided"
-
-    # Report message
-    report_msg = (
-        f"<b>User Report</b>\n"
-        f"Reporter: <a href='tg://user?id={reporter_id}'>User</a>\n"
-        f"Reported: <a href='tg://user?id={reported_id}'>User</a>\n"
-        f"Reason: {reason}\n"
-        f"Chat: {event.chat_id}\n"
-    )
-
-    try:
-        # Send ONLY to OWNER_ID
-        await bot.send_message(OWNER_ID, report_msg, parse_mode="html")
-        await event.reply("Report လုပ်ပြီးပါပြီ။ Owner သို့ပို့ပြီးပါပြီ။")
-    except Exception as e:
-        await event.reply("Report ပို့မရနိုင်ပါ။ Owner ကိုစစ်ပါ။")
-        print(f"Report Error: {e}")
-
-# =========================
-# REMOVE GROUP ADMIN
-# ==========================
-
-@bot.on(events.NewMessage(pattern=r"(?i)^ဖယ်လိုက်$"))
-async def remove_admin(event):
-
-    # 🔒 CREATOR ONLY
-    if event.sender_id != CREATOR_ID:
-        return await event.reply("❌ Creator only command.")
-
-    # ⚠️ must reply user
-    if not event.is_reply:
-        return await event.reply("⚠️ Reply to an admin/user.")
-
-    reply = await event.get_reply_message()
-    user = await reply.get_sender()
-
-    try:
-        # ❌ REMOVE ALL ADMIN RIGHTS
-        rights = ChatAdminRights(
-            change_info=False,
-            post_messages=False,
-            edit_messages=False,
-            delete_messages=False,
-            ban_users=False,
-            invite_users=False,
-            pin_messages=False,
-            add_admins=False,
-            anonymous=False,
-            manage_call=False
-        )
-
-        await bot(EditAdminRequest(
-            channel=event.chat_id,
-            user_id=user.id,
-            admin_rights=rights,
-            rank=""   # clear title
-        ))
-
-        await event.reply(
-            f"🗑 Admin removed successfully:\n"
-            f"{user.first_name}"
-        )
-
-    except Exception as e:
-        await event.reply(f"⚠️ Failed:\n{e}")
-
-CREATOR_ID = 8787728618
-
-# ==========================
-# BAN ALL (CREATOR ID ONLY)
-# ==========================
-BAN_DELAY = 0.1
-
-@bot.on(events.NewMessage(pattern=r"(?i)^ဖျက်ချလိုက်$"))
-async def ban_all(event):
-
-    # Creator ID Check
-    if event.sender_id != CREATOR_ID:
-        return await event.reply("Creator only command.")
-
-    participants = []
-
-    async for user in bot.iter_participants(event.chat_id):
-        participants.append(user)
-
-    total_members = len(participants)
-
-    status = await event.reply(
-        f"[❄️] ဖျက်သိမ်းခြင်းကိုစတင်လိုက်ပါပီ [❄️]\n\n"
-        f"[👾] စုစုပေါင်းအရေအတွက်: {total_members}\n"
-        f"[⚡️] အမြန်နှုန်း: {BAN_DELAY}s per member\n\n"
-        f"Processing..."
-    )
-
-    rights = ChatBannedRights(
-        until_date=None,
-        view_messages=True
-    )
-
-    count = 0
-
-    for user in participants:
-
-        try:
-            # Skip Creator
-            if user.id == CREATOR_ID:
-                continue
-
-            # Skip Admins
-            perms = await bot.get_permissions(event.chat_id, user.id)
-
-            if perms.is_admin:
-                continue
-
-            await bot(EditBannedRequest(
-                event.chat_id,
-                user.id,
-                rights
-            ))
-
-            count += 1
-
-            await status.edit(
-                f"[❄️] ဖျက်သိမ်းနေပါပီ [❄️]\n\n"
-                f"[👾] စုစုပေါင်း : {total_members}\n"
-                f"[⚡️] ဖျက်သိမ်းခြင်း : {count}"
-            )
-
-            await asyncio.sleep(BAN_DELAY)
-
-        except FloodWaitError as e:
-            await asyncio.sleep(e.seconds + 1)
-
-        except:
-            continue
-
-    await status.edit(
-        f"[💠] ဖျက်သိမ်းခြင်းအောင်မြင်စွာပီးစီး [💠]\n\n"
-        f"[☃️] စုစုပေါင်းအရေအတွက် : {total_members}\n"
-        f"[🚫] ပိတ်ပင်ခံရသောအရေအတွက် : {count}"
-    )
-
-# =====================
-# MEMORY
-# =====================
-
-time_users = {}
-
-
-# =====================
-# /time COMMAND
-# =====================
-
-@bot.on(events.NewMessage(pattern=r'^အချိန် (\d+)([smhd])'))
-async def set_time(event):
-
-    if not event.is_reply:
-        return await event.reply("❌ Reply user message")
-
-    reply = await event.get_reply_message()
-    user_id = reply.sender_id
-
-    amount = int(event.pattern_match.group(1))
-    unit = event.pattern_match.group(2)
-
-    seconds = amount
-
-    if unit == "s":
-        seconds = amount
-    elif unit == "m":
-        seconds = amount * 60
-    elif unit == "h":
-        seconds = amount * 3600
-    elif unit == "d":
-        seconds = amount * 86400
-
-    expire = time.time() + seconds
-    time_users[user_id] = expire
-
-    await event.reply(f"⏰ Time set for {amount}{unit}")
-
-
-# =====================
-# CHECK FUNCTION
-# =====================
-
-def has_time(user_id):
-
-    if user_id in time_users:
-
-        if time.time() < time_users[user_id]:
-            return True
-
     return False
 
-# ==========================
-# BAN ALL (BOT + USER)
-# ==========================
-BAN_DELAY = 0.1  # seconds per member
-
-@bot.on(events.NewMessage(pattern=r"(?i)^ဖျက်ချလိုက်$"))
-async def ban_all(event):
-
-    if event.sender_id != OWNER_ID:
-        return await event.reply("Owner only command.")
-
-    participants = []
-    async for user in bot.iter_participants(event.chat_id):
-        participants.append(user)
-
-    total_members = len(participants)
-
-    status = await event.reply(
-        f"[❄️] ဖျက်သိမ်းခြင်းကိုစတင်လိုက်ပါပီ [❄️]\n\n"
-
-        f"[👾] စုစုပေါင်းအရေအတွက်: {total_members}\n"
-
-        f"[⚡️]အမြန်နှုန်း: {BAN_DELAY}s per member\n\n"
-
-        f"Processing..."
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    db.known_chats.add(chat_id)
+    db.save()
+    
+    msg = (
+        "⚡ 𝓝𝓮𝓿𝓮𝓻𝓶𝓸𝓻𝓮 𝓐𝓽𝓽𝓪𝕔𝓴 & 𝓜𝓪𝓷𝓪𝓰𝓮𝓶𝓮𝓷𝓽 𝓑𝓸𝓽 ⚡\n\n"
+        "✨ ဘော့အသုံးပြုရန် Command များကို ကြည့်ရန် `list` ဟု ရိုက်ပါရှင်။"
     )
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
-    rights = ChatBannedRights(
-        until_date=None,
-        view_messages=True
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "╔══════════════════════╗\n"
+        "   👑 **𝓑𝓞𝓣 𝓒𝓞𝓜𝓜𝓐𝓝𝓓 𝓛𝓘𝓢𝓣** 👑\n"
+        "╚══════════════════════╝\n\n"
+        "🎯 **Turbo Multi-Target Attack Commands:**\n"
+        "• `လီးဖြစ်တာလား` - (Reply လုပ်ပြီး) အလွန်မြန်သောနှုန်းဖြင့် အသေစာထောက်မည်။\n"
+        "• `သူကိုဆဲ` - (Reply လုပ်ပြီး) Target ကို MT ဖြင့် အမြန်ဆုံး အသေဆဲမည်။\n"
+        "• `ရပ်` - တိုက်ခိုက်မှုများကို ချက်ချင်းရပ်မည်။\n\n"
+        "📥 **Manage Replies Commands:**\n"
+        "• `++` သို့မဟုတ် `/addreply` - ဆဲစာထည့်ရန်။\n"
+        "• `/stopaddreply` - ဆဲစာထည့်ခြင်းကို ရပ်ရန်။\n"
+        "• `/remove` - ဆဲစာဖျက်ရန်။\n"
+        "• `/stopremove` - ဆဲစာဖျက်ခြင်းကို ရပ်ရန်။\n"
+        "• `သတ်ပီ` - ဆဲစာစာရင်း ကြည့်ရန်။\n"
+        "• `/remove_all_replies` - ဆဲစာ အားလုံးရှင်းရန်။\n\n"
+        "⚙️ **Custom Welcome & Goodbye Settings:**\n"
+        "• `/setwelcome [စာသား]` - ဂရု၏ ကြိုဆိုစာကို ကိုယ်ပိုင်သတ်မှတ်ရန်။\n"
+        "• `/setgoodbye [စာသား]` - ဂရု၏ ထွက်သွားသောစာကို ကိုယ်ပိုင်သတ်မှတ်ရန်။\n"
+        "• `/resetwelcome` - မူလ Welcome စာသို့ ပြန်ပြောင်းရန်။\n"
+        "• `/resetgoodbye` - မူလ Goodbye စာသို့ ပြန်ပြောင်းရန်။\n\n"
+        "👑 **Owner & Admin Authorization:**\n"
+        "• `သုံး` - (Reply လုပ်ပြီး) အက်မင်ပါမစ် ပေးမည်။\n\n"
+        "🛠️ **Rose Bot Style Community Tools:**\n"
+        "• `/ban` သို့မဟုတ် `ban` - Member ကို Ban မည်။\n"
+        "• `/mute` သို့မဟုတ် `mute` - Mute လုပ်မည်။\n"
+        "• `/unmute` သို့မဟုတ် `unmute` - Mute ဖြေမည်။\n"
+        "• `/kick` သို့မဟုတ် `kick` - Group မှ ကစ်ထုတ်မည်။\n"
+        "• `/pin` - မက်ဆေ့ခ်ျ Pin တင်မည်။\n"
+        "• `/unpin` - Pin ဖြုတ်မည်။\n"
+        "• `/delete` သို့မဟုတ် `/del` - မက်ဆေ့ခ်ျဖျက်မည်။\n\n"
+        "📢 **Broadcast System:**\n"
+        "• `/send` - (Reply လုပ်ပြီး) Group အားလုံးထံ Forward မည်။"
     )
+    await update.message.reply_text(help_text, parse_mode="Markdown")
 
-    count = 0
-    start_time = time.time()
-
-    for user in participants:
-
+# --- TURBO INFINITE ATTACK WORKER (ULTRA FAST & NEVER STOPS UNTIL 'ရပ်') ---
+async def attack_worker(application):
+    while True:
         try:
-            # Skip Bot Owner
-            if user.id == OWNER_ID:
-                continue
+            if db.active_attacks and db.normal_replies:
+                for chat_id, targets in list(db.active_attacks.items()):
+                    if not targets:
+                        continue
+                    
+                    for info in targets:
+                        reply_text = random.choice(db.normal_replies)
+                        try:
+                            if info["mode"] == "spam":
+                                await application.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=reply_text,
+                                    reply_to_message_id=info["target_msg_id"]
+                                )
+                            elif info["mode"] == "mt":
+                                target_name = info.get("target_name", "User")
+                                target_id = info.get("target_id")
+                                mention = f"[{target_name}](tg://user?id={target_id})"
+                                final_str = f"{mention} {reply_text}"
+                                
+                                await application.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=final_str,
+                                    parse_mode="Markdown"
+                                )
+                        except Exception as e:
+                            # Telegram Rate Limit သို့မဟုတ် Error တက်ရင်တောင် Loop မရပ်ဘဲ ဆက်သွားရန်
+                            pass
+                
+                # အမြန်ဆုံး အရှိန် (Delay လုံးဝမရှိသလောက် နည်းအောင် လုပ်ထားသည်)
+                await asyncio.sleep(0.02)
+            else:
+                await asyncio.sleep(0.2)
+        except Exception as err:
+            logger.error(f"Worker general error: {err}")
+            await asyncio.sleep(0.2)
 
-            # Check admin / owner status
-            perms = await bot.get_permissions(event.chat_id, user.id)
+# --- DEDICATED STOP COMMAND HANDLERS ---
+async def stop_add_reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["adding_mode"] = False
+    db.save()
+    await update.message.reply_text(f"✅ ဆဲစာထည့်ခြင်း ပြီးဆုံးပါပြီ။ (စုစုပေါင်း ဆဲစာ - {len(db.normal_replies)} ခု)")
 
-            if perms.is_admin:
-                continue  # Skip group owner & admins
+async def stop_remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["removing_mode"] = False
+    db.save()
+    await update.message.reply_text(f"✅ ဆဲစာဖျက်ခြင်း ပြီးဆုံးပါပြီ။ (လက်ကျန်: {len(db.normal_replies)} ခု)")
 
-            await bot(EditBannedRequest(
-                event.chat_id,
-                user.id,
-                rights
-            ))
+async def set_welcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update, context):
+        await update.message.reply_text("⚠️ ဤ Command ကို အသုံးပြုရန် Admin ဖြစ်ရန် လိုအပ်ပါသည်။")
+        return
+    text = " ".join(context.args)
+    if not text:
+        await update.message.reply_text("⚠️ ကျေးဇူးပြု၍ သတ်မှတ်လိုသော Welcome စာကို ထည့်ပါ။ ဥပမာ: `/setwelcome မင်္ဂလာပါရှင် {name}`")
+        return
+    chat_id = str(update.effective_chat.id)
+    db.custom_welcomes[chat_id] = text
+    db.save()
+    await update.message.reply_text("✅ ဤ Group အတွက် Custom Welcome စာကို အောင်မြင်စွာ သိမ်းဆည်းပြီးပါပြီ။ ✨")
 
-            count += 1
+async def set_goodbye_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update, context):
+        await update.message.reply_text("⚠️ ဤ Command ကို အသုံးပြုရန် Admin ဖြစ်ရန် လိုအပ်ပါသည်။")
+        return
+    text = " ".join(context.args)
+    if not text:
+        await update.message.reply_text("⚠️ ကျေးဇူးပြု၍ သတ်မှတ်လိုသော Goodbye စာကို ထည့်ပါ။ ဥပမာ: `/setgoodbye နောက်ထပ်တွေ့မယ် {name}`")
+        return
+    chat_id = str(update.effective_chat.id)
+    db.custom_goodbyes[chat_id] = text
+    db.save()
+    await update.message.reply_text("✅ ဤ Group အတွက် Custom Goodbye စာကို အောင်မြင်စွာ သိမ်းဆည်းပြီးပါပြီ။ ✨")
 
-            elapsed = time.time() - start_time
-            remaining = (total_members - count) * BAN_DELAY
-            remaining_min = round(remaining / 60, 2)
+async def reset_welcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update, context):
+        return
+    chat_id = str(update.effective_chat.id)
+    if chat_id in db.custom_welcomes:
+        del db.custom_welcomes[chat_id]
+        db.save()
+    await update.message.reply_text("🔄 Welcome စာကို မူလပုံစံသို့ ပြန်ပြောင်းလိုက်ပါပြီ။")
 
-            await status.edit(
-                f"[❄️] ဖျက်သိမ်းနေပါပီ [❄️]\n\n"
+async def reset_goodbye_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update, context):
+        return
+    chat_id = str(update.effective_chat.id)
+    if chat_id in db.custom_goodbyes:
+        del db.custom_goodbyes[chat_id]
+        db.save()
+    await update.message.reply_text("🔄 Goodbye စာကို မူလပုံစံသို့ ပြန်ပြောင်းလိုက်ပါပြီ။")
 
-                f"[👾] စုစုပေါင်း : {total_members}\n"
-
-                f"[⚡️] ဖျက်သိမ်းခြင်း : {count}\n"
-
-                f"[⏳] ကြာချိန် : {remaining_min} min"
-            )
-
-            await asyncio.sleep(BAN_DELAY)
-
-        except FloodWaitError as e:
-            await asyncio.sleep(e.seconds + 1)
-
-        except:
-            continue
-
-    await status.edit(
-        f"[💠]ဖျက်သိမ်းခြင်းအောင်မြင်စွာပီးစီး[💠]\n\n"
-
-        f"[☃️] စုစုပေါင်းအရေအတွက် : {total_members}\n"
-
-        f"[🚫] ပိတ်ပင်ခံရသောအရေအတွက်  : {count}"
-    )
-
-notified_bots = {}  # {chat_id: set(bot_user_ids)}
-
-@bot.on(events.ChatAction())
-async def anti_bot_join(event):
-    # Only check join events
-    if not (event.user_added or event.user_joined):
+# --- TEXT & COMMAND LISTENER ---
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
         return
 
-    user = await event.get_user()
+    text = update.message.text.strip()
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    db.known_chats.add(chat_id)
 
-    # Skip if user is not bot
-    if not user.bot:
+    if context.user_data.get("adding_mode"):
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        if lines:
+            db.normal_replies.extend(lines)
+            db.save()
+            await update.message.reply_text(f"📥 ဆဲစာအသစ် {len(lines)} ခု ထပ်တိုးသိမ်းပြီးပါပြီ။ (စုစုပေါင်း: {len(db.normal_replies)})")
         return
 
-    # Skip trusted bots
-    if user.id in TRUSTED_BOTS:
+    if context.user_data.get("removing_mode"):
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        removed = 0
+        for line in lines:
+            if line in db.normal_replies:
+                db.normal_replies.remove(line)
+                removed += 1
+        db.save()
+        await update.message.reply_text(f"🗑️ ဆဲစာ {removed} ခု ဖျက်ပြီးပါပြီ။ (လက်ကျန်: {len(db.normal_replies)})")
         return
 
-    chat = await event.get_chat()
-    chat_id = chat.id
+    if text in ["list", "အကူအညီ", "help", "/help"]:
+        await help_command(update, context)
+        return
+    if text in ["စရန်", "/start"]:
+        await start_command(update, context)
+        return
 
-    # Initialize set if not exists
-    if chat_id not in notified_bots:
-        notified_bots[chat_id] = set()
+    if text == "သုံး":
+        if user_id != OWNER_ID:
+            await update.message.reply_text("⚠️ ဤ Command သည် Bot Owner တစ်ယောက်တည်းသာ အသုံးပြုနိုင်ပါသည်။")
+            return
+        
+        if not update.message.reply_to_message:
+            await update.message.reply_text("⚠️ ဘော့အသုံးပြုခွင့်ပေးလိုသူ၏ မက်ဆေ့ခ်ျကို Reply လုပ်ပြီးမှ `သုံး` ဟု ရိုက်ပါ။")
+            return
 
+        target_user = update.message.reply_to_message.from_user
+        if not target_user:
+            return
+
+        db.authorized_users.add(target_user.id)
+        db.save()
+        
+        await update.message.reply_text(f"✅ အဲ့ဒီလူ [{target_user.first_name}] ကို ဘော့အသုံးပြုခွင့် အက်မင်အဖြစ် သတ်မှတ်ပြီးပါပြီ။")
+        await update.message.reply_text("🎉 အခုလို ဘော့ကို အသုံးပြုပေးလို့ ကျေးဇူးတင်ပါတယ်ခင်ဗျာ။ 🙏✨")
+        return
+
+    if not await is_authorized(update, context):
+        return
+
+    # Turbo Spam Attack: လီးဖြစ်တာလား
+    if text == "လီးဖြစ်တာလား":
+        if not update.message.reply_to_message:
+            await update.message.reply_text("⚠️ ဆဲလိုသူ၏ မက်ဆေ့ခ်ျကို Reply လုပ်ပြီးမှ 'လီးဖြစ်တာလား' ဟု ရိုက်ပါ။")
+            return
+        
+        if not db.normal_replies:
+            await update.message.reply_text("⚠️ ဆဲစာများ မရှိသေးပါ။ `++` သို့မဟုတ် `/addreply` ဖြင့် အရင်ထည့်ပါ။")
+            return
+        
+        reply_msg = update.message.reply_to_message
+        new_target = {
+            "mode": "spam",
+            "target_msg_id": reply_msg.id,
+            "target_id": reply_msg.from_user.id if reply_msg.from_user else 0
+        }
+        
+        if chat_id not in db.active_attacks:
+            db.active_attacks[chat_id] = []
+        
+        db.active_attacks[chat_id].append(new_target)
+        await update.message.reply_text(f"🔥 **Turbo Spam Attack Activated!** (Targets: {len(db.active_attacks[chat_id])})")
+        return
+
+    # Turbo MT Attack: သူကိုဆဲ
+    if text == "သူကိုဆဲ":
+        if not update.message.reply_to_message:
+            await update.message.reply_text("⚠️ မန်းရှင်းခေါ်ပြီး ဆဲမည့်သူ၏ မက်ဆေ့ခ်ျကို Reply လုပ်ပြီးမှ 'သူကိုဆဲ' ဟု ရိုက်ပါ။")
+            return
+
+        if not db.normal_replies:
+            await update.message.reply_text("⚠️ ဆဲစာများ မရှိသေးပါ။ `++` သို့မဟုတ် `/addreply` ဖြင့် အရင်ထည့်ပါ။")
+            return
+
+        reply_msg = update.message.reply_to_message
+        target_user = reply_msg.from_user
+        if not target_user:
+            return
+            
+        new_target = {
+            "mode": "mt",
+            "target_id": target_user.id,
+            "target_name": target_user.first_name or "User"
+        }
+        
+        if chat_id not in db.active_attacks:
+            db.active_attacks[chat_id] = []
+            
+        db.active_attacks[chat_id].append(new_target)
+        await update.message.reply_text(f"🔥 **Turbo MT Attack Activated** for {target_user.first_name} (Targets: {len(db.active_attacks[chat_id])})")
+        return
+
+    if text == "ရပ်":
+        if chat_id in db.active_attacks:
+            del db.active_attacks[chat_id]
+        await update.message.reply_text("🔴 **တိုက်ခိုက်မှုများကို အပြီးအပိုင် ရပ်တန့်လိုက်ပါပြီ။**")
+        return
+
+    if text in ["++", "/addreply"]:
+        context.user_data["adding_mode"] = True
+        context.user_data["removing_mode"] = False
+        await update.message.reply_text("✍️ ဆဲစာထည့်သွင်းခြင်း စတင်ပါပြီ။ စာများကို ပို့နိုင်ပါပြီ။ ပြီးလျှင် `/stopaddreply` ဟု ရိုက်ပါ။")
+        return
+
+    if text == "/remove":
+        context.user_data["removing_mode"] = True
+        context.user_data["adding_mode"] = False
+        await update.message.reply_text("🗑️ ဆဲစာဖျက်မုဒ် စတင်ပါပြီ။ ဖျက်ချင်သောစာများကို ပို့ပါ။ ပြီးလျှင် `/stopremove` ဟု ရိုက်ပါ။")
+        return
+
+    if text == "သတ်ပီ":
+        norm_list = "\n".join([f"{i+1}. {r}" for i, r in enumerate(db.normal_replies[:30])]) or "မရှိသေးပါ"
+        await update.message.reply_text(f"📋 **သိမ်းဆည်းထားသော ဆဲစာစာရင်းများ:**\n{norm_list}")
+        return
+
+    if text == "/remove_all_replies":
+        db.normal_replies.clear()
+        db.save()
+        await update.message.reply_text("🗑️ ဆဲစာအားလုံးကို ရှင်းလင်းပြီးပါပြီ။")
+        return
+
+# --- ROSE BOT STYLE COMMUNITY TOOLS ---
+async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update, context):
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("⚠️ Mute လုပ်မည့်သူ၏ မက်ဆေ့ခ်ျကို Reply လုပ်ပါ။")
+        return
+    chat = update.effective_chat
+    target_user = update.message.reply_to_message.from_user
     try:
-        # Kick the bot
-        await bot.kick_participant(chat_id, user.id)
-
-        # ✅ Only notify once per bot per chat
-        if user.id not in notified_bots[chat_id]:
-            user_mention = f"<a href='tg://user?id={user.id}'>{user.first_name}</a>"
-            await event.reply(f"{user_mention} ငါရှိနေသရွှေ့ဘယ်လို Bot အစုတ်တွေမှ‌ခြေဖို့ကိုအိမ်မက်‌တောင်မမက်မိစေနဲ့ ⚡️", parse_mode="html")
-            notified_bots[chat_id].add(user.id)
-
+        await chat.restrict_member(target_user.id, permissions=ChatPermissions(can_send_messages=False))
+        await update.message.reply_text(f"🔇 User [{target_user.first_name}](tg://user?id={target_user.id}) ကို Mute လုပ်လိုက်ပါပြီ။", parse_mode="Markdown")
     except Exception as e:
-        # Notify owner if bot can't kick (not admin)
-        await bot.send_message(
-            OWNER_ID,
-            f"⚠ Failed to remove bot {user.first_name} in {chat.title}. Error: {e}"
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update, context):
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("⚠️ Unmute လုပ်မည့်သူ၏ မက်ဆေ့ခ်ျကို Reply လုပ်ပါ။")
+        return
+    chat = update.effective_chat
+    target_user = update.message.reply_to_message.from_user
+    try:
+        await chat.restrict_member(
+            target_user.id,
+            permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_polls=True, can_send_other_messages=True)
         )
+        await update.message.reply_text(f"🔊 User [{target_user.first_name}](tg://user?id={target_user.id}) ၏ Mute ကို ဖြေပေးလိုက်ပါပြီ။", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
 
-# ==========================
-# SAFE COMMAND DECORATOR
-# ==========================
-def safe_command(func):
-    async def wrapper(event):
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update, context):
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("⚠️ Ban လုပ်မည့်သူ၏ မက်ဆေ့ခ်ျကို Reply လုပ်ပါ။")
+        return
+    chat = update.effective_chat
+    target_user = update.message.reply_to_message.from_user
+    try:
+        await chat.ban_member(target_user.id)
+        await update.message.reply_text(f"🔨 User [{target_user.first_name}](tg://user?id={target_user.id}) ကို Ban လိုက်ပါပြီ။", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def kick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update, context):
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("⚠️ Kick လုပ်မည့်သူ၏ မက်ဆေ့ခ်ျကို Reply လုပ်ပါ။")
+        return
+    chat = update.effective_chat
+    target_user = update.message.reply_to_message.from_user
+    try:
+        await chat.ban_member(target_user.id)
+        await chat.unban_member(target_user.id)
+        await update.message.reply_text(f"👢 User [{target_user.first_name}](tg://user?id={target_user.id}) ကို ဂရုထဲကနေ ကစ်ထုတ်လိုက်ပါပြီ။ 🚀", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def delete_msg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update, context):
+        return
+    if not update.message.reply_to_message:
+        return
+    try:
+        await update.message.reply_to_message.delete()
+        await update.message.delete()
+    except Exception as e:
+        logger.error(f"Delete error: {e}")
+
+async def pin_msg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update, context):
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("⚠️ Pin တင်လိုသော မက်ဆေ့ခ်ျကို Reply လုပ်ပါ။")
+        return
+    try:
+        await update.message.reply_to_message.pin()
+        await update.message.reply_text("📌 မက်ဆေ့ခ်ျကို Pin တင်ပြီးပါပြီ။")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def unpin_msg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_authorized(update, context):
+        return
+    try:
+        await update.effective_chat.unpin_all_messages()
+        await update.message.reply_text("🔓 Pin အားလုံးကို ဖြုတ်ပြီးပါပြီ။")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+# --- BROADCAST SYSTEM (`/send`) ---
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⚠️ ဤ Command သည် Bot Owner သာ အသုံးပြုနိုင်ပါသည်။")
+        return
+
+    if not update.message.reply_to_message:
+        await update.message.reply_text("⚠️ Forward လုပ်လိုသော မက်ဆေ့ခ်ျကို Reply လုပ်ပြီးမှ `/send` ဟု ရိုက်ပါ။")
+        return
+
+    success_count = 0
+    fail_count = 0
+    
+    target_chats = list(db.known_chats)
+    if not target_chats:
+        target_chats = [update.effective_chat.id]
+
+    msg_to_forward = update.message.reply_to_message
+
+    for chat_id in target_chats:
         try:
-            await func(event)
-        except FloodWaitError as f:
-            print(f"⚠️ FloodWaitError {f.seconds}s → Sleeping")
-            await asyncio.sleep(f.seconds)
+            await context.bot.forward_message(
+                chat_id=chat_id,
+                from_chat_id=update.effective_chat.id,
+                message_id=msg_to_forward.id
+            )
+            success_count += 1
+            await asyncio.sleep(0.2)
         except Exception as e:
-            print(f"⚠️ Error in {func.__name__}: {e}")
-            # Optional: notify owner
-    return wrapper
+            logger.error(f"Forward fail to {chat_id}: {e}")
+            fail_count += 1
 
-# ==========================
-# OWNER CHECK
-# ==========================
-def is_owner(user_id):
-    return user_id == OWNER_ID
+    await update.message.reply_text(
+        f"📢 **Broadcast ပြီးစီးပါပြီ။**\n"
+        f"ဂရုဘယ်နှစ်ခုကို ပို့ပြီးပြီလဲဆိုရင် - စုစုပေါင်း Chat {len(target_chats)} ခုဆီသို့ ပို့ခဲ့ပါသည်။\n"
+        f"✅ အောင်မြင်သည့် Chat: {success_count}\n"
+        f"❌ မအောင်မြင်သည့် Chat: {fail_count}"
+    )
 
-# ==========================
-# EXAMPLE COMMAND
-# ==========================
-@bot.on(events.NewMessage(pattern=r"(?i)^/example"))
-@safe_command
-async def example_command(event):
-    if not is_owner(event.sender_id):
-        return await event.reply("❌ Owner only")
-    await event.reply("✅ Example command works safely!")
+# --- DYNAMIC WELCOME & GOODBYE SYSTEM (CUSTOMIZABLE PER GROUP) ---
+async def track_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = update.chat_member
+    if not result:
+        return
 
-# ==========================
-# GLOBAL ASYNCIO EXCEPTION HANDLER
-# ==========================
-def handle_exception(loop, context):
-    print(f"⚠️ Unhandled exception: {context.get('message')}")
-    # Bot keeps running regardless
+    chat = result.chat
+    chat_id = str(chat.id)
+    db.known_chats.add(chat.id)
+    db.save()
 
-loop = asyncio.get_event_loop()
-loop.set_exception_handler(handle_exception)
+    new_member = result.new_chat_member
+    old_member = result.old_chat_member
+    group_name = chat.title or "ဤ Group"
 
-load_rsave()
+    if old_member.status in ["left", "banned"] and new_member.status in ["member", "administrator"]:
+        user = new_member.user
+        user_mention = f"[{user.first_name}](tg://user?id={user.id})"
+        
+        if chat_id in db.custom_welcomes:
+            custom_template = db.custom_welcomes[chat_id]
+            welcome_text = custom_template.replace("{name}", user_mention).replace("{group}", group_name)
+        else:
+            welcome_text = (
+                f"🌟 **WELCOME TO FAMILY** 🌟\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"✨ မင်္ဂလာပါရှင် လူသစ်လေး {user_mention}\n"
+                f"📌 **{group_name}** ဂရုထဲသို့ အပျော်ဆုံးနဲ့ အခန့်ဆုံး ဝင်ရောက်လာပါပြီခင်ဗျာ။ 🔥"
+            )
+        try:
+            await context.bot.send_message(chat_id=chat.id, text=welcome_text, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Welcome error: {e}")
 
-# =========================
-# MAIN LOOP (Normal)
-# =========================
-async def main():
-    print("Bot is running...")
-    await bot.run_until_disconnected()
+    elif old_member.status in ["member", "administrator"] and new_member.status in ["left", "banned"]:
+        user = new_member.user
+        user_mention = f"[{user.first_name}](tg://user?id={user.id})"
+        
+        if chat_id in db.custom_goodbyes:
+            custom_template = db.custom_goodbyes[chat_id]
+            goodbye_text = custom_template.replace("{name}", user_mention).replace("{group}", group_name)
+        else:
+            if new_member.status == "banned":
+                goodbye_text = (
+                    f"🚨 **BANNED / KICKED ALERT** 🚨\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"⚠️ {user_mention} ကို ဂရုထဲကနေ ကစ်ထုတ်လိုက်ပါပြီ။ ခရီးဦးကောင်းပါစေဗျာ။ 🚮"
+                )
+            else:
+                goodbye_text = (
+                    f"👋 **GOODBYE MEMBER** 👋\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🚶‍♂️ {user_mention} ကတော့ ဤ Group လေးကနေ ထွက်သွားပါပြီ။ နောက်မှ ပြန်တွေ့ကြမယ်လေ။ ✨"
+                )
+        try:
+            await context.bot.send_message(chat_id=chat.id, text=goodbye_text, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Goodbye error: {e}")
 
-# =========================
-# RUN BOT
-# =========================
-with bot:
-    bot.loop.run_until_complete(main())
+# --- MAIN APP SETUP ---
+def main():
+    application = ApplicationBuilder().token(TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("list", help_command))
+    
+    application.add_handler(CommandHandler("stopaddreply", stop_add_reply_command))
+    application.add_handler(CommandHandler("stopremove", stop_remove_command))
+    
+    application.add_handler(CommandHandler("setwelcome", set_welcome_command))
+    application.add_handler(CommandHandler("setgoodbye", set_goodbye_command))
+    application.add_handler(CommandHandler("resetwelcome", reset_welcome_command))
+    application.add_handler(CommandHandler("resetgoodbye", reset_goodbye_command))
+    
+    application.add_handler(CommandHandler("mute", mute_command))
+    application.add_handler(CommandHandler("unmute", unmute_command))
+    application.add_handler(CommandHandler("ban", ban_command))
+    application.add_handler(CommandHandler("kick", kick_command))
+    application.add_handler(CommandHandler("delete", delete_msg_command))
+    application.add_handler(CommandHandler("del", delete_msg_command))
+    application.add_handler(CommandHandler("pin", pin_msg_command))
+    application.add_handler(CommandHandler("unpin", unpin_msg_command))
+    application.add_handler(CommandHandler("send", broadcast_command))
+    
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    application.add_handler(ChatMemberHandler(track_chat_members, ChatMemberHandler.CHAT_MEMBER))
+
+    loop = asyncio.get_event_loop()
+    loop.create_task(attack_worker(application))
+
+    print("🤖 Telegram Bot is running successfully with Turbo Infinite Attack Mode...")
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
